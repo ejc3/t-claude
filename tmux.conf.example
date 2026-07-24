@@ -1,0 +1,19 @@
+# Native scrollback for Claude Code in tmux — swipe (iOS) / wheel (desktop) scrolls the
+# terminal's OWN scrollback, as if tmux weren't there. All four pieces are load-bearing;
+# see the README for why. Single full-screen pane only (splits re-break it).
+
+# 1. Stay on the primary screen (the alternate screen has no scrollback).
+set -ga terminal-overrides ',*:smcup@:rmcup@'
+
+# 2. Full-screen pane, so tmux scrolls the whole screen, not a sub-region
+#    (region-scrolled lines are discarded by the terminal).
+set -g status off
+
+# 3. Scroll with plain linefeeds, never CSI S (some clients drop CSI-S-scrolled lines).
+set -ga terminal-overrides ',*:indn@'
+
+# 4. Mouse OFF so tmux does not capture the wheel into copy-mode.
+set -g mouse off
+
+# The terminal owns scrollback now; this is just a copy-mode fallback (Ctrl-b [ , q).
+set -g history-limit 10000
