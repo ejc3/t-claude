@@ -152,5 +152,11 @@ t-claude() {
   fi
 
   tmux select-window -t "$win"
-  if [ -n "${TMUX-}" ]; then tmux switch-client -t "=$session"; else tmux attach -t "=$session"; fi
+  # attach -d: detach any OTHER clients on this session first. Eternal Terminal
+  # reconnects (network blips, keyboard show/hide, rotation) each leave a stale tmux
+  # client behind; with the default window-size=latest the window then snaps to
+  # whichever stale client last had activity -- cropping Claude to an old, smaller
+  # height. Detaching others keeps exactly one client, so the window always tracks
+  # the terminal you are actually looking at.
+  if [ -n "${TMUX-}" ]; then tmux switch-client -t "=$session"; else tmux attach -d -t "=$session"; fi
 }
