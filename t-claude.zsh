@@ -158,5 +158,22 @@ t-claude() {
   # whichever stale client last had activity -- cropping Claude to an old, smaller
   # height. Detaching others keeps exactly one client, so the window always tracks
   # the terminal you are actually looking at.
+  # Replay scrollback before attaching. tmux repaints only the VISIBLE pane on attach;
+  # everything that scrolled past lives in tmux's grid and is never re-emitted, so after
+  # a reconnect the terminal's own scrollback starts empty and swiping up shows nothing
+  # (measured: 23 of 60 lines survive a reattach -- just the one visible screen).
+  # capture-pane -S - -E -1 dumps exactly the history ABOVE the visible screen, so tmux's
+  # own repaint supplies the rest and nothing is duplicated (measured: 60/60, 0 dupes;
+  # replaying the whole buffer instead double-paints the screen).
+  # -e keeps colours. Skipped when already inside tmux (switch-client does not repaint
+  # the outer terminal) and when there is no history yet.
+  if [ -z "${TMUX-}" ]; then
+    local hist
+    hist="$(tmux display-message -p -t "$win" '#{history_size}' 2>/dev/null)"
+    if [ -n "$hist" ] && [ "$hist" -gt 0 ] 2>/dev/null; then
+      tmux capture-pane -p -e -S - -E -1 -t "$win" 2>/dev/null
+    fi
+  fi
+
   if [ -n "${TMUX-}" ]; then tmux switch-client -t "=$session"; else tmux attach -d -t "=$session"; fi
 }
