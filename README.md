@@ -88,6 +88,17 @@ as a **job** — so Ctrl-Z suspends Claude and `fg` resumes it. (Running Claude 
 command directly can't support Ctrl-Z: a pane command is a session leader, and POSIX
 silently discards stop signals sent to an orphaned process group.)
 
+## Window title & notifications
+
+Claude sets a terminal title (OSC 0) as it works and rings the bell for attention. tmux only
+forwards a title to the outer terminal when `set-titles` is on, so without it the tab never
+picks up the rename — even though `nosync-wrap` passes the title through untouched.
+`set-titles on` with `set-titles-string "#{pane_title}"` forwards exactly what Claude set, so
+a rename inside Claude renames the terminal tab (and, over ssh through a terminal like cmux,
+the outer tab). `allow-passthrough on` lets OSC 9 / OSC 777 desktop notifications through and
+`monitor-bell` tracks the bell. These reach the focused pane's terminal; a bell in a
+background tmux window may only raise a tmux alert rather than a desktop notification.
+
 ## Usage
 
 ```zsh
