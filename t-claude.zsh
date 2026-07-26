@@ -11,13 +11,23 @@
 #                          synchronized-output sequences (CSI ?2026h/l) so tmux does not
 #                          swallow scrollback. OPTIONAL: if absent, launches bare claude
 #                          (scrollback breaks, everything else works).
-#   - ~/.tmux.conf         for native (swipe/wheel) scrollback, needs all three:
-#                            set -ga terminal-overrides ',*:smcup@:rmcup@'   (primary screen)
-#                            set -g status off                               (full-screen pane)
-#                            set -ga terminal-overrides ',*:indn@'           (linefeed scroll)
-#                          and a SINGLE full-screen pane (splits re-break scrollback).
 #   - HIST_IGNORE_SPACE    set in ~/.zshrc -- lets the space-prefixed launch command stay
 #                          out of shell history (see the `cmd=" $inner"` note below).
+#
+# NOT required: a pre-configured ~/.tmux.conf. Earlier versions depended on the host having
+# deployed the native-scrollback settings (smcup@/rmcup@, status off, indn@, mouse off) into
+# a static config file -- correct on the boxes that had it, silently broken (no scrollback,
+# no error) on any host where that file was missing, stale, or reverted. t-claude now sets
+# those options itself, at runtime, on every invocation -- see APPLY_SCROLLBACK_SETTINGS
+# below. This makes the script self-contained: copy it to a fresh host with nothing but zsh
+# and tmux installed and scrollback works on the first run, no separate provisioning step.
+#
+# These are GLOBAL session options, so they apply to the whole tmux SERVER, not just the
+# window t-claude creates -- a plain `tmux` invoked later on the same server (no t-claude)
+# inherits them too, as long as t-claude has run at least once since that server started.
+# A hand-written ~/.tmux.conf can still coexist: it loads once at server start, t-claude's
+# settings are asserted after and win regardless of invocation order, so a stray or outdated
+# config file can no longer silently break scrollback.
 #
 #   SESSION : tmux session = a named group of related projects ("Apps","Backend",
 #             "AWS"). Omit it and the session defaults to "<folder>-<hash>" (unique
@@ -34,6 +44,26 @@
 t-claude() {
   local session="" resume="" folder base cmd key winname win hash explicit=0
   folder="$PWD"
+
+  # APPLY_SCROLLBACK_SETTINGS -- run before anything else touches tmux, so it takes effect
+  # whether this call ends up creating the server, creating a session on an already-running
+  # server, or just attaching to one. `tmux set-option -g` implicitly starts the server if
+  # none is listening (same as `tmux new-session` does), so this is safe as the very first
+  # tmux command of a cold invocation.
+  #
+  # Exactly the three settings the earlier ~/.tmux.conf documented as load-bearing for
+  # native (swipe/wheel) scrollback -- see README.md for the mechanism and measurements.
+  # Idempotent and cheap: re-asserting on every call, rather than checking first, is simpler
+  # and correctly self-heals if something else (a hand-edited config, a stray `tmux source`)
+  # changed one of these since the last invocation.
+  tmux set-option -g status off 2>/dev/null
+  tmux set-option -g mouse off 2>/dev/null
+  tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null
+  tmux set-option -ga terminal-overrides ',*:indn@' 2>/dev/null
+  # Not scrollback-critical, but cheap insurance against tmux 3.8's default flipping to
+  # `mouse on` (see the ~/.tmux.conf history this replaces) and against unbounded memory use
+  # in copy-mode's fallback buffer (tmux has no byte cap on history-limit).
+  tmux set-option -g history-limit 10000 2>/dev/null
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
