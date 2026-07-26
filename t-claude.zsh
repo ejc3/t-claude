@@ -1,4 +1,11 @@
-# t-claude [SESSION] [--resume <id>]
+# t-claude [SESSION] [--resume <id>] [-- CLAUDE_ARGS...]
+#
+# Anything t-claude does not itself recognise is passed straight through to the `claude`
+# invocation, unmodified and in order -- e.g. `t-claude --remote-control` or
+# `t-claude mysession --model sonnet`. Only the FIRST bare (non-flag) argument is ever
+# claimed as SESSION; every later argument, flag or not, is passthrough. This is what
+# lets the managed remote-control units below (agents-start) run the exact same launcher a
+# person uses interactively, just with `--remote-control` appended.
 #
 # PREREQUISITES (all provided by the dev-box setup in ejc3/aws dev-user-data.tf; listed
 # here so this script is self-documenting if copied elsewhere):
@@ -43,15 +50,28 @@
 # found, reused, renamed, moved, or closed.
 t-claude() {
   local session="" resume="" folder base cmd key winname win hash explicit=0
+  local -a passthrough
   folder="$PWD"
 
+  # SESSION, if given, must be the very first argument -- matching the usage line above,
+  # which always lists it first. Pinning it to position 1 removes an ambiguity that would
+  # otherwise exist once arbitrary flags are let through: a bare token later in the list
+  # might be a flag's VALUE ("--model sonnet") rather than a session name, and there is no
+  # way to tell those apart without knowing every claude flag's arity -- exactly the thing
+  # passthrough exists to not need to know.
+  if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    session="$1"; shift
+  fi
+
+  # Only --resume is t-claude's own -- it changes the window/session naming below, so it
+  # has to be pulled out and understood, not just relayed. Everything else, dash-prefixed
+  # or not, is collected in order and handed to claude verbatim.
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --resume=*) resume="${1#--resume=}"; shift ;;
       --resume)
         if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then resume="$2"; shift 2; else shift; fi ;;
-      -*) shift ;;
-      *) [ -z "$session" ] && session="$1"; shift ;;
+      *) passthrough+=("$1"); shift ;;
     esac
   done
 
@@ -80,9 +100,21 @@ t-claude() {
   # their own; a flag cannot, so it belongs in this command.
   local wrap=""; command -v nosync-wrap >/dev/null 2>&1 && wrap="nosync-wrap "
   local flags="--dangerously-skip-permissions --effort ultracode"
+  # Each passthrough element is quoted INDIVIDUALLY (zsh's (@q) flag), then joined with
+  # real spaces -- not the whole array quoted as one blob, which collapses every element
+  # into a single argument (tested; the join-then-quote ordering produces
+  # '--model\ sonnet\ --flag', which re-parses back to ONE argument, not two). Verified
+  # round-trip on values containing spaces, an embedded "=", and a semicolon + shell
+  # metacharacters -- all survive as one inert literal argument rather than breaking out,
+  # since this string is ultimately typed into a live shell via tmux send-keys.
+  local extra=""
+  if [ "${#passthrough[@]}" -gt 0 ]; then
+    local -a qpass; qpass=("${(@q)passthrough}")
+    extra=" ${qpass[*]}"
+  fi
   local inner
-  if [ -n "$resume" ]; then inner="${wrap}claude --resume $resume $flags"
-  else inner="${wrap}claude --resume $flags"; fi
+  if [ -n "$resume" ]; then inner="${wrap}claude --resume $resume $flags$extra"
+  else inner="${wrap}claude --resume $flags$extra"; fi
 
   # Ctrl-Z NOTE: the window is created running your normal interactive shell, and
   # claude is then sent to it as a JOB. Running claude as the pane command directly
