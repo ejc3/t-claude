@@ -45,26 +45,6 @@ t-claude() {
   local session="" resume="" folder base cmd key winname win hash explicit=0
   folder="$PWD"
 
-  # APPLY_SCROLLBACK_SETTINGS -- run before anything else touches tmux, so it takes effect
-  # whether this call ends up creating the server, creating a session on an already-running
-  # server, or just attaching to one. `tmux set-option -g` implicitly starts the server if
-  # none is listening (same as `tmux new-session` does), so this is safe as the very first
-  # tmux command of a cold invocation.
-  #
-  # Exactly the three settings the earlier ~/.tmux.conf documented as load-bearing for
-  # native (swipe/wheel) scrollback -- see README.md for the mechanism and measurements.
-  # Idempotent and cheap: re-asserting on every call, rather than checking first, is simpler
-  # and correctly self-heals if something else (a hand-edited config, a stray `tmux source`)
-  # changed one of these since the last invocation.
-  tmux set-option -g status off 2>/dev/null
-  tmux set-option -g mouse off 2>/dev/null
-  tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null
-  tmux set-option -ga terminal-overrides ',*:indn@' 2>/dev/null
-  # Not scrollback-critical, but cheap insurance against tmux 3.8's default flipping to
-  # `mouse on` (see the ~/.tmux.conf history this replaces) and against unbounded memory use
-  # in copy-mode's fallback buffer (tmux has no byte cap on history-limit).
-  tmux set-option -g history-limit 10000 2>/dev/null
-
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --resume=*) resume="${1#--resume=}"; shift ;;
@@ -180,6 +160,49 @@ t-claude() {
       fi
     fi
   fi
+
+  # APPLY_SCROLLBACK_SETTINGS -- deliberately placed HERE, not at the top of the function.
+  # `tmux set-option -g` does NOT reliably start a fresh server on its own: tested directly,
+  # a server started with no session ever created can exit before the next command reaches
+  # it (exit-empty), so global options set before any session exists can silently vanish.
+  # By this point every branch above (found, moved, or newly created) guarantees a session
+  # is alive, so the server cannot be reaped out from under these calls.
+  #
+  # Exactly the three settings the earlier ~/.tmux.conf documented as load-bearing for
+  # native (swipe/wheel) scrollback -- see README.md for the mechanism and measurements.
+  #
+  # SCOPED AS LOCALLY AS TMUX ALLOWS. `status`, `mouse` and `history-limit` are SESSION
+  # options -- targeted at "=$session" (no -g), so only sessions t-claude manages are
+  # touched. An unrelated `tmux` a user starts by hand on the same server, or a session
+  # someone else is running, is left at whatever it already had. Confirmed against tmux's
+  # own option-scope docs (`man tmux`), not assumed from the `-g` flag's shape -- server
+  # options, session options, window options and pane options are four different things
+  # that all happen to accept a flag that LOOKS the same in a config file.
+  #
+  # `terminal-overrides` genuinely cannot be scoped narrower: it is a SERVER option (see
+  # `man tmux`, "Available server options"), so setting it always affects every session on
+  # this server, including ones t-claude does not manage. There is no per-session terminfo
+  # override in tmux -- this is a real ceiling, not a choice made for convenience.
+  #
+  # `set-option` on a plain (session) option overwrites a single value, so calling it every
+  # invocation is naturally idempotent. `set-option -ga` on terminal-overrides APPENDS,
+  # which is not: tested directly, 4 raw invocations left 9 duplicate entries in the option
+  # string -- and t-claude runs on every single launch/attach, so an unguarded append would
+  # grow without bound over a tmux server's lifetime (these run for weeks). Check before
+  # appending so it is idempotent for real, not just in a comment.
+  # NOTE: no "=" exact-match prefix here, unlike has-session/list-windows elsewhere in this
+  # script. Tested directly: `set-option -t "=$session"` fails outright with "no such
+  # session: =foo", even though has-session accepts that exact syntax for the exact same
+  # session -- set-option's session-target resolution does not accept it. Bare "$session"
+  # works and, tested against two sessions "foo" and "foobar", correctly hits only the exact
+  # match rather than affecting both -- tmux prefers an exact match when one exists.
+  tmux set-option -t "$session" status off 2>/dev/null
+  tmux set-option -t "$session" mouse off 2>/dev/null
+  tmux set-option -t "$session" history-limit 10000 2>/dev/null
+  local overrides
+  overrides="$(tmux show-options -gv terminal-overrides 2>/dev/null)"
+  case "$overrides" in *'smcup@:rmcup@'*) ;; *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;; esac
+  case "$overrides" in *'indn@'*) ;; *) tmux set-option -ga terminal-overrides ',*:indn@' 2>/dev/null ;; esac
 
   tmux select-window -t "$win"
   # attach -d: detach any OTHER clients on this session first. Eternal Terminal
