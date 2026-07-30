@@ -41,7 +41,9 @@
 #             per directory).
 #   WINDOW  : one per project folder, keyed by folder path (hidden @tclaude_key), so
 #             two same-named folders never collide.
-#   --resume <id> : a NEW window "<folder>-<id>" (claude session id as discriminator).
+#   --resume <id> : its OWN session "<folder>-<id>" (unless a SESSION is named), so each id
+#                   attaches in its own terminal tab and several run side by side without
+#                   detaching each other. Pass an explicit SESSION to group ids as windows.
 #   PANES   : never touched — split your own terminal in with Ctrl-b % / ".
 # If you pass a SESSION but this folder's claude is already open in a DIFFERENT
 # session, t-claude MOVES it here live (move-window keeps claude running) — no prompt,
@@ -88,6 +90,16 @@ t-claude() {
   if [ -n "$session" ]; then
     explicit=1
     session="$(printf '%s' "$session" | tr -c 'A-Za-z0-9_-' '_')"
+  elif [ -n "$resume" ]; then
+    # A --resume id with no explicit session gets its OWN session, named "<folder>-<id>".
+    # Two clients attached to the SAME tmux session mirror each other (shared current window)
+    # and `attach -d` below detaches the other one -- that is the "[detached from ...]" seen
+    # when the same folder's my-diffs and my-reviews were two WINDOWS in one session and each
+    # was opened in its own terminal tab. Separate sessions are independent: each attaches in
+    # its own tab, both run at once, no detach and no mirroring. Idempotent because ${PWD:A}
+    # keeps the folder half stable, so re-running the same id reuses this session.
+    local rsan; rsan="$(printf '%s' "$resume" | tr -c 'A-Za-z0-9_-' '_')"
+    session="${base}-${rsan}"
   else
     hash="$(printf '%s' "$folder" | cksum | awk '{printf "%x", $1}')"
     session="${base}-${hash}"
