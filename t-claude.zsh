@@ -36,45 +36,114 @@
 # settings are asserted after and win regardless of invocation order, so a stray or outdated
 # config file can no longer silently break scrollback.
 #
-#   SESSION : tmux session = a named group of related projects ("Apps","Backend",
-#             "AWS"). Omit it and the session defaults to "<folder>-<hash>" (unique
-#             per directory).
-#   WINDOW  : one per project folder, keyed by folder path (hidden @tclaude_key), so
-#             two same-named folders never collide.
-#   --resume <id> : its OWN session "<folder>-<id>" (unless a SESSION is named), so each id
-#                   attaches in its own terminal tab and several run side by side without
-#                   detaching each other. Pass an explicit SESSION to group ids as windows.
-#   PANES   : never touched — split your own terminal in with Ctrl-b % / ".
-# If you pass a SESSION but this folder's claude is already open in a DIFFERENT
-# session, t-claude MOVES it here live (move-window keeps claude running) — no prompt,
-# since the move is non-destructive.
-# Safety: only windows WE create carry @tclaude_key, so manual windows are never
-# found, reused, renamed, moved, or closed.
+# THE MODEL (matches how cmux shows a tmux server: session -> left-sidebar entry, window ->
+# tab across the top, pane -> split inside a tab):
+#   SESSION : name it to GROUP related claudes ("apps", "backend") -- one left-sidebar entry.
+#             OMIT it and everything ungrouped shares one session, "main". A session's claudes
+#             are its WINDOWS (tabs).
+#   WINDOW  : one per (physical folder, --resume id), keyed by that pair (hidden @tclaude_key).
+#             Titled by the folder's BASENAME, extended with just enough parent path only when
+#             two windows in the same session would otherwise read the same (see relabel).
+#   --resume <id> : another window in the same session -- a distinct tab. Reusing an id reuses
+#                   its window rather than stacking a second claude.
+#   PANES   : never touched -- split your own terminal in with Ctrl-b % / ".
+#   Every terminal that attaches gets its OWN throwaway GROUPED VIEW of the session, parked on
+#   its window. Two terminals can then show different windows of one session at the same time
+#   without mirroring, and neither detaches the other. The views self-destroy when their tab
+#   closes (client-detached hook), with a start-of-run reap as backstop.
+# If you pass a SESSION but this folder's claude is already open in a DIFFERENT session,
+# t-claude MOVES it here live (move-window keeps claude running) -- no prompt, non-destructive.
+# Safety: only windows WE create carry @tclaude_key, so manual windows are never found,
+# reused, renamed, moved, or closed.
+
+# Last k path components of PATH joined by "/", clamped to what the path has. Used to build
+# window titles: 1 = basename, grown only on collision.
+_tclaude_win_suffix() {
+  emulate -L zsh
+  local p="$1"; integer k="${2:-1}"
+  local -a parts=(${(s:/:)p})
+  integer n=$#parts
+  (( n == 0 )) && { print -r -- "$p"; return }
+  (( k < 1 )) && k=1
+  (( k > n )) && k=$n
+  print -r -- "${(j:/:)parts[n-k+1,n]}"
+}
+
+# Title every t-claude window in SESSION by folder basename, extending a colliding pair with
+# parent path components until unique -- so "bleh" stays "bleh" until a second "bleh" shows up,
+# then both become "apps/bleh", "core/bleh" (and deeper if still equal). The resume id is
+# appended and also disambiguates, so only same-basename + same-resume + different-folder pairs
+# ever grow. Reads @tclaude_path / @tclaude_resume (stored per window); renames only on change.
+_tclaude_relabel() {
+  emulate -L zsh
+  local sess="$1"
+  local -a ids paths resumes
+  local id p r
+  while IFS=$'\t' read -r id p r; do
+    [ -n "$p" ] || continue
+    ids+=("$id"); paths+=("$p"); resumes+=("$r")
+  done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{@tclaude_path}\t#{@tclaude_resume}' 2>/dev/null)
+  integer n=$#ids
+  (( n == 0 )) && return
+  integer -a kc; local -a disp; integer i j
+  for (( i=1; i<=n; i++ )); do kc[$i]=1; disp[$i]="$(_tclaude_win_suffix "$paths[$i]" 1)"; done
+  integer changed=1 guard=0
+  while (( changed )) && (( guard < 64 )); do
+    changed=0; (( guard++ ))
+    for (( i=1; i<=n; i++ )); do
+      for (( j=i+1; j<=n; j++ )); do
+        if [[ "$disp[$i]" == "$disp[$j]" && "$resumes[$i]" == "$resumes[$j]" ]]; then
+          integer ni=$(( kc[$i]+1 )) nj=$(( kc[$j]+1 ))
+          local si="$(_tclaude_win_suffix "$paths[$i]" $ni)" sj="$(_tclaude_win_suffix "$paths[$j]" $nj)"
+          [[ "$si" != "$disp[$i]" ]] && { kc[$i]=$ni; disp[$i]="$si"; changed=1 }
+          [[ "$sj" != "$disp[$j]" ]] && { kc[$j]=$nj; disp[$j]="$sj"; changed=1 }
+        fi
+      done
+    done
+  done
+  for (( i=1; i<=n; i++ )); do
+    local name="$disp[$i]"
+    [ -n "$resumes[$i]" ] && name="${name}-${resumes[$i]}"
+    name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._/-' '_')"   # keep / . _ - ; no ':' (breaks targets)
+    local cur; cur="$(tmux display-message -p -t "$ids[$i]" '#{window_name}' 2>/dev/null)"
+    [[ "$cur" == "$name" ]] || tmux rename-window -t "$ids[$i]" "$name" 2>/dev/null
+  done
+}
+
 t-claude() {
-  local session="" resume="" folder base cmd key winname win hash explicit=0
+  local session="" resume="" folder base cmd key winname win explicit=0
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
-  # and session identity are keyed off this, and $PWD is not stable for one directory: on a
-  # dev box HOME=/home/ejc3 but ~/fbsource is a symlink to /data/users/ejc3/fbsource, so
-  # `cd ~/fbsource` leaves $PWD=/home/ejc3/fbsource in one shell while another shell that
-  # reached the same dir another way has $PWD=/data/users/ejc3/fbsource. Keyed off $PWD those
-  # look like two folders -- two sessions, and two `--resume` windows scatter across them
-  # instead of pairing up. The physical path is the same string however you got there.
+  # identity is keyed off this, and $PWD is not stable for one directory: on a dev box
+  # HOME=/home/ejc3 but ~/fbsource is a symlink to /data/users/ejc3/fbsource, so `cd ~/fbsource`
+  # leaves $PWD=/home/ejc3/fbsource in one shell while another shell that reached the same dir
+  # another way has $PWD=/data/users/ejc3/fbsource. Keyed off $PWD those look like two folders.
+  # The physical path is the same string however you got there.
   folder="${PWD:A}"
 
-  # SESSION, if given, must be the very first argument -- matching the usage line above,
-  # which always lists it first. Pinning it to position 1 removes an ambiguity that would
-  # otherwise exist once arbitrary flags are let through: a bare token later in the list
-  # might be a flag's VALUE ("--model sonnet") rather than a session name, and there is no
-  # way to tell those apart without knowing every claude flag's arity -- exactly the thing
-  # passthrough exists to not need to know.
+  # Reap our own stale grouped views: sessions we made (name ends "__tcv__<digits>") with no
+  # attached client, left behind if a client died without the client-detached hook firing. Two
+  # guards: match only that exact suffix (so a user session merely containing "__tcv__" is never
+  # touched), and only kill views older than 20s -- a view sits 0-client for a moment between
+  # new-session and attach, and a concurrent launch's reap must not kill one mid-setup. Never
+  # touches cmux-view-* or real sessions. `date` failing -> now=0 -> reaps nothing (safe).
+  local vs now; now="$(date +%s 2>/dev/null || echo 0)"
+  for vs in $(tmux list-sessions -F '#{session_name} #{session_attached} #{session_created}' 2>/dev/null | awk -v now="$now" '$1 ~ /__tcv__[0-9]+$/ && $2==0 && (now-$3) > 20 {print $1}'); do
+    tmux kill-session -t "=$vs" 2>/dev/null
+  done
+
+  # SESSION, if given, must be the very first argument -- matching the usage line above. Pinning
+  # it to position 1 removes an ambiguity that would otherwise exist once arbitrary flags are let
+  # through: a bare token later in the list might be a flag's VALUE ("--model sonnet") rather than
+  # a session name, and there is no way to tell those apart without knowing every claude flag's
+  # arity -- exactly the thing passthrough exists to not need to know.
   if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
     session="$1"; shift
   fi
 
-  # Only --resume is t-claude's own -- it changes the window/session naming below, so it
-  # has to be pulled out and understood, not just relayed. Everything else, dash-prefixed
-  # or not, is collected in order and handed to claude verbatim.
+  # Only --resume is t-claude's own -- it names the window and keys it, so it has to be pulled
+  # out and understood, not just relayed. Everything else, dash-prefixed or not, is collected in
+  # order and handed to claude verbatim.
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --resume=*) resume="${1#--resume=}"; shift ;;
@@ -85,47 +154,32 @@ t-claude() {
   done
 
   base="${folder##*/}"; [ -z "$base" ] && base="root"
-  base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9_-' '_')"
+  base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '_')"
 
+  # Grouping: an explicit SESSION groups related claudes under one sidebar entry; without one,
+  # everything ungrouped shares "main". (No per-folder/per-resume default -- that fragmented the
+  # sidebar into an entry per directory. The grouped-view attach below lets several windows of one
+  # session each live in their own terminal tab without detaching, so one shared session is fine.)
   if [ -n "$session" ]; then
     explicit=1
     session="$(printf '%s' "$session" | tr -c 'A-Za-z0-9_-' '_')"
-  elif [ -n "$resume" ]; then
-    # A --resume id with no explicit session gets its OWN session, named "<folder>-<id>".
-    # Two clients attached to the SAME tmux session mirror each other (shared current window)
-    # and `attach -d` below detaches the other one -- that is the "[detached from ...]" seen
-    # when the same folder's my-diffs and my-reviews were two WINDOWS in one session and each
-    # was opened in its own terminal tab. Separate sessions are independent: each attaches in
-    # its own tab, both run at once, no detach and no mirroring. Idempotent because ${PWD:A}
-    # keeps the folder half stable, so re-running the same id reuses this session.
-    local rsan; rsan="$(printf '%s' "$resume" | tr -c 'A-Za-z0-9_-' '_')"
-    session="${base}-${rsan}"
   else
-    hash="$(printf '%s' "$folder" | cksum | awk '{printf "%x", $1}')"
-    session="${base}-${hash}"
+    session="main"
   fi
 
   key="$(printf '%s' "$folder" | cksum | awk '{print $1}')_$(printf '%s' "$resume" | cksum | awk '{print $1}')"
-  winname="$base"; [ -n "$resume" ] && winname="${base}-$(printf '%s' "$resume" | tr -c 'A-Za-z0-9_-' '_')"
-  # nosync-wrap strips Claude's synchronized-output-mode sequences (CSI ?2026h/l)
-  # before tmux sees them. tmux buffers all grid updates while sync mode is active and
-  # emits only a viewport redraw, so scrolled-off lines never reach the host terminal's
-  # native scrollback -- verified by strace on the live process (2026h emitted) and by
-  # a 40/40-vs-23/40 scrollback measurement with and without the wrapper. Falls back to
-  # bare claude if the wrapper is missing, so t-claude never breaks.
-  # Pass --effort here rather than relying on a claude() wrapper in ~/.zshrc: the command
-  # runs as `nosync-wrap claude ...`, so the shell runs nosync-wrap and any such function is
-  # skipped, leaving the window on the default effort. Exported variables still arrive on
-  # their own; a flag cannot, so it belongs in this command.
+  winname="$base"; [ -n "$resume" ] && winname="${base}-$(printf '%s' "$resume" | tr -c 'A-Za-z0-9._-' '_')"
+  # nosync-wrap strips Claude's synchronized-output-mode sequences (CSI ?2026h/l) before tmux
+  # sees them so scrolled-off lines reach native scrollback. Falls back to bare claude if absent.
+  # Pass --effort here rather than a claude() wrapper in ~/.zshrc: the command runs as
+  # `nosync-wrap claude ...`, so the shell runs nosync-wrap and the function is skipped -- a flag
+  # can't be exported, so it belongs in this command.
   local wrap=""; command -v nosync-wrap >/dev/null 2>&1 && wrap="nosync-wrap "
   local flags="--dangerously-skip-permissions --effort ultracode"
-  # Each passthrough element is quoted INDIVIDUALLY (zsh's (@q) flag), then joined with
-  # real spaces -- not the whole array quoted as one blob, which collapses every element
-  # into a single argument (tested; the join-then-quote ordering produces
-  # '--model\ sonnet\ --flag', which re-parses back to ONE argument, not two). Verified
-  # round-trip on values containing spaces, an embedded "=", and a semicolon + shell
-  # metacharacters -- all survive as one inert literal argument rather than breaking out,
-  # since this string is ultimately typed into a live shell via tmux send-keys.
+  # Each passthrough element is quoted INDIVIDUALLY (zsh's (@q)), then joined with real spaces --
+  # not the whole array quoted as one blob, which collapses to a single argument. Verified
+  # round-trip on values with spaces, "=", and shell metacharacters, since this string is
+  # ultimately typed into a live shell via tmux send-keys.
   local extra=""
   if [ "${#passthrough[@]}" -gt 0 ]; then
     local -a qpass; qpass=("${(@q)passthrough}")
@@ -135,15 +189,9 @@ t-claude() {
   if [ -n "$resume" ]; then inner="${wrap}claude --resume $resume $flags$extra"
   else inner="${wrap}claude --resume $flags$extra"; fi
 
-  # Ctrl-Z NOTE: the window is created running your normal interactive shell, and
-  # claude is then sent to it as a JOB. Running claude as the pane command directly
-  # cannot support Ctrl-Z at all: a pane command is a session leader, so its process
-  # group is ORPHANED and POSIX silently discards stop signals. As a shell job it lives
-  # in the shell's session, so Ctrl-Z suspends it and `fg` resumes it -- verified.
-  # Leading space keeps this out of shell history: ~/.zshrc sets HIST_IGNORE_SPACE, so
-  # zsh skips space-prefixed commands. Without it every launch types the full
-  # "nosync-wrap claude --resume ..." line into the window's shell and it lands in
-  # history, cluttering it and polluting up-arrow / Ctrl-R for the folder you work in.
+  # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
+  # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
+  # discards stop signals). Leading space keeps the launch line out of history (HIST_IGNORE_SPACE).
   cmd=" $inner"
 
   # already the requested session's window?
@@ -152,16 +200,15 @@ t-claude() {
     win="$(tmux list-windows -t "=$session" -F '#{window_id} #{@tclaude_key}' 2>/dev/null | awk -v k="$key" '$2==k {print $1; exit}')"
   fi
 
-  # explicit session, not here yet: if this folder's claude is open in another
-  # session, move it here live (non-destructive — claude keeps running).
+  # explicit session, not here yet: if this folder's claude is open in another session, move it
+  # here live (non-destructive -- claude keeps running).
   if [ -z "$win" ] && [ "$explicit" = 1 ]; then
     local hit osess owin ph
-    # Coexist with a cmux-driven tmux: cmux's linked-view multiplexer link-windows every
-    # real session's windows into a hidden "cmux-view-*" session, so a t-claude window is
-    # listed twice by `list-windows -a` (its home session AND the view). Exclude view
-    # sessions here, matching cmux's own invariant (all "cmux-view-*" sessions are excluded;
-    # each window has one deterministic home). Without this the move below could grab the
-    # linked copy and move-window it out of the view, corrupting the mirror.
+    # Coexist with a cmux-driven tmux: cmux's linked-view multiplexer link-windows every real
+    # session's windows into a hidden "cmux-view-*" session, so a t-claude window is listed twice
+    # by `list-windows -a` (its home session AND the view). Exclude view sessions here, matching
+    # cmux's own invariant (all "cmux-view-*" excluded; each window has one deterministic home).
+    # Without this the move below could grab the linked copy and move-window it out of the view.
     hit="$(tmux list-windows -a -F '#{session_name} #{window_id} #{@tclaude_key}' 2>/dev/null | awk -v k="$key" '$1 !~ /^cmux-view-/ && $3==k {print $1" "$2; exit}')"
     if [ -n "$hit" ]; then
       osess="${hit% *}"; owin="${hit#* }"; ph=""
@@ -179,8 +226,6 @@ t-claude() {
   # nothing to reuse/move: add a new window (creating the session if needed)
   local created=0
   if [ -z "$win" ]; then
-    # Create the window running the plain interactive shell (no command), then send
-    # claude to it as a job -- see the Ctrl-Z note above.
     if tmux has-session -t "=$session" 2>/dev/null; then
       win="$(tmux new-window -d -P -F '#{window_id}' -t "=$session" -n "$winname" -c "$folder")"
     else
@@ -192,16 +237,11 @@ t-claude() {
     created=1
   fi
 
-  # Reusing a window whose claude has exited: since the window now runs the shell rather
-  # than claude itself, it survives that exit still carrying @tclaude_key, so t-claude
-  # would hand you an empty prompt and never start claude again.
-  #
-  # Look for claude among the window shell's children, not merely for "any child". Running
-  # t-claude from inside the very window it is about to reuse -- which is exactly what you
-  # do after claude prints "Resume this session with" -- means our own command
-  # substitutions are children of that shell, so an any-child test always says claude is
-  # alive and silently does nothing. A claude suspended with Ctrl-Z still matches here, so
-  # a stopped session never gets a second claude stacked on it.
+  # Reusing a window whose claude has exited: the window now runs the shell (claude was a job), so
+  # it survives that exit still carrying @tclaude_key. Look for claude among the shell's children,
+  # not "any child" -- running t-claude from inside the very window it reuses makes our own command
+  # substitutions children of that shell. A claude suspended with Ctrl-Z still matches, so a
+  # stopped session never gets a second claude stacked on it.
   if [ "$created" = 0 ]; then
     local pane_pid kid alive=0
     pane_pid="$(tmux display-message -p -t "$win" '#{pane_pid}' 2>/dev/null)"
@@ -218,41 +258,20 @@ t-claude() {
     fi
   fi
 
-  # APPLY_SCROLLBACK_SETTINGS -- deliberately placed HERE, not at the top of the function.
-  # `tmux set-option -g` does NOT reliably start a fresh server on its own: tested directly,
-  # a server started with no session ever created can exit before the next command reaches
-  # it (exit-empty), so global options set before any session exists can silently vanish.
-  # By this point every branch above (found, moved, or newly created) guarantees a session
-  # is alive, so the server cannot be reaped out from under these calls.
-  #
-  # Exactly the three settings the earlier ~/.tmux.conf documented as load-bearing for
-  # native (swipe/wheel) scrollback -- see README.md for the mechanism and measurements.
-  #
-  # SCOPED AS LOCALLY AS TMUX ALLOWS. `status`, `mouse` and `history-limit` are SESSION
-  # options -- targeted at "=$session" (no -g), so only sessions t-claude manages are
-  # touched. An unrelated `tmux` a user starts by hand on the same server, or a session
-  # someone else is running, is left at whatever it already had. Confirmed against tmux's
-  # own option-scope docs (`man tmux`), not assumed from the `-g` flag's shape -- server
-  # options, session options, window options and pane options are four different things
-  # that all happen to accept a flag that LOOKS the same in a config file.
-  #
-  # `terminal-overrides` genuinely cannot be scoped narrower: it is a SERVER option (see
-  # `man tmux`, "Available server options"), so setting it always affects every session on
-  # this server, including ones t-claude does not manage. There is no per-session terminfo
-  # override in tmux -- this is a real ceiling, not a choice made for convenience.
-  #
-  # `set-option` on a plain (session) option overwrites a single value, so calling it every
-  # invocation is naturally idempotent. `set-option -ga` on terminal-overrides APPENDS,
-  # which is not: tested directly, 4 raw invocations left 9 duplicate entries in the option
-  # string -- and t-claude runs on every single launch/attach, so an unguarded append would
-  # grow without bound over a tmux server's lifetime (these run for weeks). Check before
-  # appending so it is idempotent for real, not just in a comment.
-  # NOTE: no "=" exact-match prefix here, unlike has-session/list-windows elsewhere in this
-  # script. Tested directly: `set-option -t "=$session"` fails outright with "no such
-  # session: =foo", even though has-session accepts that exact syntax for the exact same
-  # session -- set-option's session-target resolution does not accept it. Bare "$session"
-  # works and, tested against two sessions "foo" and "foobar", correctly hits only the exact
-  # match rather than affecting both -- tmux prefers an exact match when one exists.
+  # Stamp the folder + resume so _tclaude_relabel can title windows by path (the @tclaude_key is
+  # only cksums -- the path can't be recovered from it). Set on every run so windows created by an
+  # older t-claude get labelled too. Then retitle the whole session (basename, extended on collision).
+  tmux set-option -w -t "$win" @tclaude_path "$folder" 2>/dev/null
+  tmux set-option -w -t "$win" @tclaude_resume "$resume" 2>/dev/null
+  _tclaude_relabel "$session"
+
+  # APPLY_SCROLLBACK_SETTINGS -- placed HERE, after a session is guaranteed alive, so a fresh
+  # server can't be reaped (exit-empty) out from under `set -g`. status/mouse/history are SESSION
+  # options scoped to "$session" (no -g), so only t-claude's sessions are touched. terminal-overrides
+  # is a SERVER option -- it cannot be scoped narrower (no per-session terminfo override in tmux) --
+  # and `-ga` APPENDS, so guard against unbounded duplicate growth over a weeks-long server. No "="
+  # prefix on set-option's target: tested, it fails "no such session: =foo"; bare "$session" hits the
+  # exact match when one exists.
   tmux set-option -t "$session" status off 2>/dev/null
   tmux set-option -t "$session" mouse off 2>/dev/null
   tmux set-option -t "$session" history-limit 10000 2>/dev/null
@@ -261,29 +280,28 @@ t-claude() {
   case "$overrides" in *'smcup@:rmcup@'*) ;; *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;; esac
   case "$overrides" in *'indn@'*) ;; *) tmux set-option -ga terminal-overrides ',*:indn@' 2>/dev/null ;; esac
 
-  tmux select-window -t "$win"
-  # attach -d: detach any OTHER clients on this session first. Eternal Terminal
-  # reconnects (network blips, keyboard show/hide, rotation) each leave a stale tmux
-  # client behind; with the default window-size=latest the window then snaps to
-  # whichever stale client last had activity -- cropping Claude to an old, smaller
-  # height. Detaching others keeps exactly one client, so the window always tracks
-  # the terminal you are actually looking at.
-  # Replay scrollback before attaching. tmux repaints only the VISIBLE pane on attach;
-  # everything that scrolled past lives in tmux's grid and is never re-emitted, so after
-  # a reconnect the terminal's own scrollback starts empty and swiping up shows nothing
-  # (measured: 23 of 60 lines survive a reattach -- just the one visible screen).
-  # capture-pane -S - -E -1 dumps exactly the history ABOVE the visible screen, so tmux's
-  # own repaint supplies the rest and nothing is duplicated (measured: 60/60, 0 dupes;
-  # replaying the whole buffer instead double-paints the screen).
-  # -e keeps colours. Skipped when already inside tmux (switch-client does not repaint
-  # the outer terminal) and when there is no history yet.
-  if [ -z "${TMUX-}" ]; then
+  # ATTACH. Inside tmux already: just move this one client to the window. From a bare terminal
+  # (a new cmux tab): attach a per-invocation GROUPED VIEW parked on this window -- it shares the
+  # session's windows but has its own current-window pointer, so several tabs show different windows
+  # at once with no mirroring, and `attach -d` on one view can't cross-detach another. A
+  # client-detached hook destroys the view when the tab closes; the start-of-run reap is the backstop.
+  if [ -n "${TMUX-}" ]; then
+    tmux select-window -t "$win" 2>/dev/null
+    tmux switch-client -t "=$session"
+  else
+    # Replay scrollback above the visible screen before attaching -- tmux repaints only the visible
+    # pane on attach, so native scrollback would otherwise start empty. capture-pane -S - -E -1 dumps
+    # exactly the history above the screen (measured 60/60, 0 dupes); tmux's repaint supplies the rest.
     local hist
     hist="$(tmux display-message -p -t "$win" '#{history_size}' 2>/dev/null)"
     if [ -n "$hist" ] && [ "$hist" -gt 0 ] 2>/dev/null; then
       tmux capture-pane -p -e -S - -E -1 -t "$win" 2>/dev/null
     fi
+    local view="${session}__tcv__${$}${RANDOM}"
+    tmux new-session -d -t "=$session" -s "$view" 2>/dev/null
+    tmux set-hook -t "$view" client-detached "kill-session -t $view" 2>/dev/null
+    local widx; widx="$(tmux display-message -p -t "$win" '#{window_index}' 2>/dev/null)"
+    [ -n "$widx" ] && tmux select-window -t "${view}:${widx}" 2>/dev/null
+    tmux attach -d -t "=$view"
   fi
-
-  if [ -n "${TMUX-}" ]; then tmux switch-client -t "=$session"; else tmux attach -d -t "=$session"; fi
 }
