@@ -51,7 +51,14 @@
 t-claude() {
   local session="" resume="" folder base cmd key winname win hash explicit=0
   local -a passthrough
-  folder="$PWD"
+  # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
+  # and session identity are keyed off this, and $PWD is not stable for one directory: on a
+  # dev box HOME=/home/ejc3 but ~/fbsource is a symlink to /data/users/ejc3/fbsource, so
+  # `cd ~/fbsource` leaves $PWD=/home/ejc3/fbsource in one shell while another shell that
+  # reached the same dir another way has $PWD=/data/users/ejc3/fbsource. Keyed off $PWD those
+  # look like two folders -- two sessions, and two `--resume` windows scatter across them
+  # instead of pairing up. The physical path is the same string however you got there.
+  folder="${PWD:A}"
 
   # SESSION, if given, must be the very first argument -- matching the usage line above,
   # which always lists it first. Pinning it to position 1 removes an ambiguity that would
