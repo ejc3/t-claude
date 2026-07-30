@@ -156,7 +156,13 @@ t-claude() {
   # session, move it here live (non-destructive — claude keeps running).
   if [ -z "$win" ] && [ "$explicit" = 1 ]; then
     local hit osess owin ph
-    hit="$(tmux list-windows -a -F '#{session_name} #{window_id} #{@tclaude_key}' 2>/dev/null | awk -v k="$key" '$3==k {print $1" "$2; exit}')"
+    # Coexist with a cmux-driven tmux: cmux's linked-view multiplexer link-windows every
+    # real session's windows into a hidden "cmux-view-*" session, so a t-claude window is
+    # listed twice by `list-windows -a` (its home session AND the view). Exclude view
+    # sessions here, matching cmux's own invariant (all "cmux-view-*" sessions are excluded;
+    # each window has one deterministic home). Without this the move below could grab the
+    # linked copy and move-window it out of the view, corrupting the mirror.
+    hit="$(tmux list-windows -a -F '#{session_name} #{window_id} #{@tclaude_key}' 2>/dev/null | awk -v k="$key" '$1 !~ /^cmux-view-/ && $3==k {print $1" "$2; exit}')"
     if [ -n "$hit" ]; then
       osess="${hit% *}"; owin="${hit#* }"; ph=""
       if ! tmux has-session -t "=$session" 2>/dev/null; then
