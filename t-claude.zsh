@@ -1,4 +1,4 @@
-# t-claude [SESSION] [--resume <id>] [-- CLAUDE_ARGS...]
+# t-claude [SESSION] [--resume <id> | --session-id <uuid>] [CLAUDE_ARGS...]
 #
 # Anything t-claude does not itself recognise is passed straight through to the `claude`
 # invocation, unmodified and in order -- e.g. `t-claude --remote-control` or
@@ -41,11 +41,16 @@
 #   SESSION : name it to GROUP related claudes ("apps", "backend") -- one left-sidebar entry.
 #             OMIT it and everything ungrouped shares one session, "main". A session's claudes
 #             are its WINDOWS (tabs).
-#   WINDOW  : one per (physical folder, --resume id), keyed by that pair (hidden @tclaude_key).
+#   WINDOW  : one per (physical folder, session id), keyed by that pair (hidden @tclaude_key).
 #             Titled by the folder's BASENAME, extended with just enough parent path only when
 #             two windows in the same session would otherwise read the same (see relabel).
 #   --resume <id> : another window in the same session -- a distinct tab. Reusing an id reuses
 #                   its window rather than stacking a second claude.
+#   --session-id <uuid> : like --resume for the window key, but the inner claude gets
+#                   `--session-id` -- it STARTS a conversation under a chosen id instead of
+#                   reopening one. A wrapper can hand out a deterministic id on the first run
+#                   and `--resume` the same id ever after; both runs land in the same window.
+#                   uuid-shaped ids are kept out of window titles (they key, they don't label).
 #   PANES   : never touched -- split your own terminal in with Ctrl-b % / ".
 #   Every terminal that attaches gets its OWN throwaway GROUPED VIEW of the session, parked on
 #   its window. Two terminals can then show different windows of one session at the same time
@@ -55,6 +60,15 @@
 # t-claude MOVES it here live (move-window keeps claude running) -- no prompt, non-destructive.
 # Safety: only windows WE create carry @tclaude_key, so manual windows are never found,
 # reused, renamed, moved, or closed.
+
+# True when $1 is uuid-shaped: 36 chars, hex plus exactly four dashes. Used to keep machine
+# ids out of window titles -- a uuid disambiguates the window KEY, but as a label it's noise
+# ("fbcode" beats "fbcode-2f3a4b5c-..."). Short human ids ("my-diffs") still show.
+_tclaude_is_uuid() {
+  [ "${#1}" -eq 36 ] || return 1
+  [ -z "$(printf '%s' "$1" | tr -d '0-9a-fA-F-')" ] || return 1
+  [ "$(printf '%s' "$1" | tr -cd '-' | wc -c | tr -d ' ')" -eq 4 ]
+}
 
 # Last k path components of PATH joined by "/", clamped to what the path has. Used to build
 # window titles: 1 = basename, grown only on collision.
@@ -103,7 +117,7 @@ _tclaude_relabel() {
   done
   for (( i=1; i<=n; i++ )); do
     local name="$disp[$i]"
-    [ -n "$resumes[$i]" ] && name="${name}-${resumes[$i]}"
+    if [ -n "$resumes[$i]" ] && ! _tclaude_is_uuid "$resumes[$i]"; then name="${name}-${resumes[$i]}"; fi
     name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._/-' '_')"   # keep / . _ - ; no ':' (breaks targets)
     local cur; cur="$(tmux display-message -p -t "$ids[$i]" '#{window_name}' 2>/dev/null)"
     [[ "$cur" == "$name" ]] || tmux rename-window -t "$ids[$i]" "$name" 2>/dev/null
@@ -111,7 +125,7 @@ _tclaude_relabel() {
 }
 
 t-claude() {
-  local session="" resume="" folder base cmd key winname win explicit=0
+  local session="" resume="" sid="" folder base cmd key winname win explicit=0
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
   # identity is keyed off this, and $PWD is not stable for one directory: on a dev box
@@ -141,17 +155,25 @@ t-claude() {
     session="$1"; shift
   fi
 
-  # Only --resume is t-claude's own -- it names the window and keys it, so it has to be pulled
-  # out and understood, not just relayed. Everything else, dash-prefixed or not, is collected in
-  # order and handed to claude verbatim.
+  # Only --resume and --session-id are t-claude's own -- they name the window and key it, so
+  # they have to be pulled out and understood, not just relayed. Everything else, dash-prefixed
+  # or not, is collected in order and handed to claude verbatim.
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --resume=*) resume="${1#--resume=}"; shift ;;
       --resume)
         if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then resume="$2"; shift 2; else shift; fi ;;
+      --session-id=*) sid="${1#--session-id=}"; shift ;;
+      --session-id)
+        if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then sid="$2"; shift 2; else shift; fi ;;
       *) passthrough+=("$1"); shift ;;
     esac
   done
+
+  # One id drives the window key and title: --resume wins if both were given. They differ only
+  # in which flag the inner claude gets, so a first run under --session-id and every later run
+  # under --resume with the same id share one window.
+  local tcid="$resume"; [ -z "$tcid" ] && tcid="$sid"
 
   base="${folder##*/}"; [ -z "$base" ] && base="root"
   base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '_')"
@@ -167,8 +189,11 @@ t-claude() {
     session="main"
   fi
 
-  key="$(printf '%s' "$folder" | cksum | awk '{print $1}')_$(printf '%s' "$resume" | cksum | awk '{print $1}')"
-  winname="$base"; [ -n "$resume" ] && winname="${base}-$(printf '%s' "$resume" | tr -c 'A-Za-z0-9._-' '_')"
+  key="$(printf '%s' "$folder" | cksum | awk '{print $1}')_$(printf '%s' "$tcid" | cksum | awk '{print $1}')"
+  winname="$base"
+  if [ -n "$tcid" ] && ! _tclaude_is_uuid "$tcid"; then
+    winname="${base}-$(printf '%s' "$tcid" | tr -c 'A-Za-z0-9._-' '_')"
+  fi
   # nosync-wrap strips Claude's synchronized-output-mode sequences (CSI ?2026h/l) before tmux
   # sees them so scrolled-off lines reach native scrollback. Falls back to bare claude if absent.
   # Pass --effort here rather than a claude() wrapper in ~/.zshrc: the command runs as
@@ -187,6 +212,7 @@ t-claude() {
   fi
   local inner
   if [ -n "$resume" ]; then inner="${wrap}claude --resume $resume $flags$extra"
+  elif [ -n "$sid" ]; then inner="${wrap}claude --session-id $sid $flags$extra"
   else inner="${wrap}claude --resume $flags$extra"; fi
 
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
@@ -262,7 +288,7 @@ t-claude() {
   # only cksums -- the path can't be recovered from it). Set on every run so windows created by an
   # older t-claude get labelled too. Then retitle the whole session (basename, extended on collision).
   tmux set-option -w -t "$win" @tclaude_path "$folder" 2>/dev/null
-  tmux set-option -w -t "$win" @tclaude_resume "$resume" 2>/dev/null
+  tmux set-option -w -t "$win" @tclaude_resume "$tcid" 2>/dev/null
   _tclaude_relabel "$session"
 
   # APPLY_SCROLLBACK_SETTINGS -- placed HERE, after a session is guaranteed alive, so a fresh
