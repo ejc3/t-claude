@@ -415,6 +415,37 @@ t-claude() {
   tmux set-option -t "$session" status off 2>/dev/null
   tmux set-option -t "$session" set-titles on 2>/dev/null
   tmux set-option -t "$session" set-titles-string "#{window_name}" 2>/dev/null
+
+  # Follow claude's renames INSTANTLY: /rename updates claude's OSC title within a second
+  # (measured; it never touches the tmux window name, so allow-rename can't help). A
+  # pane-title-changed hook feeds the new title through a helper that renames the window --
+  # a helper FILE because tmux expands \${...} in hook strings as environment variables,
+  # so shell logic cannot live inline. The helper ignores untagged windows, shell/host junk
+  # (claude titles start with a status glyph), and the generic "Claude Code".
+  local tsync="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/title-sync.sh"
+  mkdir -p "${tsync:h}" 2>/dev/null
+  cat > "$tsync" <<'TSYNC'
+#!/bin/sh
+# args: window_id pane_title tclaude_key window_name  (written by t-claude; regenerated every launch)
+wid="$1"; title="$2"; key="$3"; cur="$4"
+[ -n "$key" ] || exit 0
+case "$title" in
+  [A-Za-z0-9]*) exit 0 ;;
+  *" "*) ;;
+  *) exit 0 ;;
+esac
+name="${title#* }"
+case "$name" in ""|"Claude Code") exit 0 ;; esac
+name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+[ -n "$name" ] || exit 0
+[ "$name" = "$cur" ] && exit 0
+tmux set-option -w -t "$wid" @tclaude_title "$name" 2>/dev/null
+tmux rename-window -t "$wid" "$name" 2>/dev/null
+exit 0
+TSYNC
+  chmod +x "$tsync" 2>/dev/null
+  tmux set-hook -t "$session" pane-title-changed \
+    "run-shell -b \"$tsync #{q:window_id} #{q:pane_title} #{q:@tclaude_key} #{q:window_name}\"" 2>/dev/null
   tmux set-option -t "$session" mouse off 2>/dev/null
   tmux set-option -t "$session" history-limit 10000 2>/dev/null
   local overrides
