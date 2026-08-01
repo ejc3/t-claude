@@ -90,6 +90,19 @@ _tclaude_win_suffix() {
   print -r -- "${(j:/:)parts[n-k+1,n]}"
 }
 
+# Latest custom title (/rename) recorded in a claude session file, reading only the last
+# 4MB -- renames are appended, so anything recent is near the end; a title set long ago is
+# already on the window from launch. Escape-aware: a title containing \" must not truncate.
+_tclaude_file_title() {
+  [ -r "$1" ] || return 0
+  local line t
+  line="$(tail -c 4194304 "$1" 2>/dev/null | LC_ALL=C grep -aF '"type":"custom-title"' | tail -1)"
+  [ -n "$line" ] || return 0
+  t="$(printf '%s' "$line" | grep -aoE '"customTitle":"(\\\\.|[^"\\\\])*"' | head -1)"
+  t="${t#*:\"}"; t="${t%\"}"
+  printf '%s' "$t" | sed -e 's/\\\(.\)/\1/g'
+}
+
 # Title every t-claude window in SESSION. The label is the explicit --title when one was
 # given, else the folder basename, path-extended only when two windows would otherwise read
 # the same. A human --resume id is appended when it adds information: skipped when it IS the
@@ -108,7 +121,22 @@ _tclaude_relabel() {
     [ -n "${parts[2]-}" ] || continue
     ids+=("$parts[1]"); paths+=("$parts[2]")
     resumes+=("$(printf '%s' "${parts[3]-}" | tr -c 'A-Za-z0-9._-' '_')")
-    titles+=("$(printf '%s' "${parts[4]-}" | tr -c 'A-Za-z0-9._-' '_')")
+    local wt="$(printf '%s' "${parts[4]-}" | tr -c 'A-Za-z0-9._-' '_')"
+    # a /rename inside claude lands in the session file; pick it up so the tab follows.
+    # The file path is derivable from what we stamp: claude keys its projects dir by the
+    # folder with non-alphanumerics turned into "-".
+    if _tclaude_is_uuid "${parts[3]-}"; then
+      local sfile="$HOME/.claude/projects/$(printf '%s' "$parts[2]" | tr -c 'A-Za-z0-9' '-')/${parts[3]}.jsonl"
+      local ft="$(_tclaude_file_title "$sfile")"
+      if [ -n "$ft" ]; then
+        ft="$(printf '%s' "$ft" | tr -c 'A-Za-z0-9._-' '_')"
+        if [ "$ft" != "$wt" ]; then
+          wt="$ft"
+          tmux set-option -w -t "$parts[1]" @tclaude_title "$ft" 2>/dev/null
+        fi
+      fi
+    fi
+    titles+=("$wt")
   done
   integer n=$#ids
   (( n == 0 )) && return
@@ -154,9 +182,10 @@ _tclaude_relabel() {
       done
     done
   done
+  local name cur   # declared once: a bare `local` re-declaration inside the loop PRINTS the variable
   for (( i=1; i<=n; i++ )); do
-    local name="$disp[$i]${suf[$i]:+-$suf[$i]}"
-    local cur; cur="$(tmux display-message -p -t "$ids[$i]" '#{window_name}' 2>/dev/null)"
+    name="$disp[$i]${suf[$i]:+-$suf[$i]}"
+    cur="$(tmux display-message -p -t "$ids[$i]" '#{window_name}' 2>/dev/null)"
     [[ "$cur" == "$name" ]] || tmux rename-window -t "$ids[$i]" "$name" 2>/dev/null
   done
 }
