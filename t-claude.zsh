@@ -44,6 +44,8 @@
 #   WINDOW  : one per (physical folder, session id), keyed by that pair (hidden @tclaude_key).
 #             Titled by the folder's BASENAME, extended with just enough parent path only when
 #             two windows in the same session would otherwise read the same (see relabel).
+#             Closes when claude exits cleanly (/exit) -- no empty shell tab left behind; a
+#             crash or Ctrl-Z keeps the shell so you can read the error or fg.
 #   --resume <id> : another window in the same session -- a distinct tab. Reusing an id reuses
 #                   its window rather than stacking a second claude.
 #   --title <label> : window/tab label override -- the window shows <label> instead of the
@@ -237,7 +239,12 @@ t-claude() {
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
   # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
   # discards stop signals). Leading space keeps the launch line out of history (HIST_IGNORE_SPACE).
-  cmd=" $inner"
+  #
+  # `&& exit` closes the window when claude exits CLEANLY (/exit) instead of leaving an empty
+  # shell tab behind. It stays out of the way everywhere else: Ctrl-Z makes the job's status
+  # 148, so `exit` is skipped and the shell is there for fg; a crash exits nonzero, so the
+  # shell (and the error) stay visible too.
+  cmd=" $inner && exit"
 
   # already the requested session's window?
   win=""
