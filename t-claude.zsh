@@ -132,9 +132,14 @@ _tclaude_relabel() {
         [[ "$disp[$i]${suf[$i]:+-$suf[$i]}" == "$disp[$j]${suf[$j]:+-$suf[$j]}" ]] || continue
         if [[ "$resumes[$i]" != "$resumes[$j]" ]]; then
           # differing ids separate the pair even when an id equals the label: a plain fb4a
-          # window and a --resume fb4a window become fb4a and fb4a-fb4a
-          if [ -n "$resumes[$i]" ] && [ "$suf[$i]" != "$resumes[$i]" ]; then suf[i]="$resumes[$i]"; changed=1; fi
-          if [ -n "$resumes[$j]" ] && [ "$suf[$j]" != "$resumes[$j]" ]; then suf[j]="$resumes[$j]"; changed=1; fi
+          # window and a --resume fb4a window become fb4a and fb4a-fb4a. uuid ids stay out
+          # of titles normally, but an otherwise-unbreakable tie (two titled windows with
+          # the same label) gets the first 8 characters as the tiebreaker.
+          local ri="$resumes[$i]" rj="$resumes[$j]"
+          _tclaude_is_uuid "$ri" && ri="${ri[1,8]}"
+          _tclaude_is_uuid "$rj" && rj="${rj[1,8]}"
+          if [ -n "$ri" ] && [ "$suf[$i]" != "$ri" ]; then suf[i]="$ri"; changed=1; fi
+          if [ -n "$rj" ] && [ "$suf[$j]" != "$rj" ]; then suf[j]="$rj"; changed=1; fi
         else
           integer ni=$(( kc[i]+1 )) nj=$(( kc[j]+1 ))
           if [ -z "$titles[$i]" ]; then
@@ -393,6 +398,15 @@ t-claude() {
     fi
     local view="${session}__tcv__${$}${RANDOM}"
     tmux new-session -d -t "=$session" -s "$view" 2>/dev/null
+    # This view exists to show ONE window. When that window ceases to exist (claude /exits
+    # and the launch line closes it), kill the view so the client detaches all the way back
+    # to the shell -- without this, tmux parks the client on a neighboring window instead.
+    # A window MOVED to another session still exists server-wide, so regrouping does not
+    # detach viewers. The existence check is list-windows|grep: display-message accepts a
+    # dead window id without complaint (measured on 3.7b), so it cannot be the predicate;
+    # ## keeps the format literal through hook-time expansion.
+    tmux set-hook -t "$view" window-unlinked \
+      "run-shell -b \"tmux list-windows -a -F '##{window_id}' | grep -qx '$win' || tmux kill-session -t '$view'\"" 2>/dev/null
     # A grouped session shares windows but has its OWN session options, so the status-off
     # applied to the real session doesn't reach the view -- without this, a host with no
     # ~/.tmux.conf shows tmux's default green status bar in every t-claude terminal.
