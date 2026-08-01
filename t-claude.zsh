@@ -353,6 +353,10 @@ t-claude() {
     fi
     local view="${session}__tcv__${$}${RANDOM}"
     tmux new-session -d -t "=$session" -s "$view" 2>/dev/null
+    # A grouped session shares windows but has its OWN session options, so the status-off
+    # applied to the real session doesn't reach the view -- without this, a host with no
+    # ~/.tmux.conf shows tmux's default green status bar in every t-claude terminal.
+    tmux set-option -t "$view" status off 2>/dev/null
     tmux set-hook -t "$view" client-detached "kill-session -t $view" 2>/dev/null
     local widx; widx="$(tmux display-message -p -t "$win" '#{window_index}' 2>/dev/null)"
     [ -n "$widx" ] && tmux select-window -t "${view}:${widx}" 2>/dev/null
