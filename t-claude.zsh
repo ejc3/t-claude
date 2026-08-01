@@ -133,7 +133,7 @@ _tclaude_relabel() {
   done
   for (( i=1; i<=n; i++ )); do
     local name="$disp[$i]"
-    if [ -n "$resumes[$i]" ] && ! _tclaude_is_uuid "$resumes[$i]"; then name="${name}-${resumes[$i]}"; fi
+    if [ -n "$resumes[$i]" ] && ! _tclaude_is_uuid "$resumes[$i]" && [ "$resumes[$i]" != "$name" ]; then name="${name}-${resumes[$i]}"; fi
     name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._/-' '_')"   # keep / . _ - ; no ':' (breaks targets)
     local cur; cur="$(tmux display-message -p -t "$ids[$i]" '#{window_name}' 2>/dev/null)"
     [[ "$cur" == "$name" ]] || tmux rename-window -t "$ids[$i]" "$name" 2>/dev/null
@@ -212,8 +212,11 @@ t-claude() {
   # --title labels the window instead of the folder basename (relabel keeps it verbatim).
   [ -n "$title" ] && title="$(printf '%s' "$title" | tr -c 'A-Za-z0-9._-' '_')"
   winname="${title:-$base}"
+  # Append a human id (e.g. --resume my-diffs) unless it IS the label already --
+  # "fb4a --resume fb4a" should read "fb4a", not "fb4a-fb4a".
   if [ -n "$tcid" ] && ! _tclaude_is_uuid "$tcid"; then
-    winname="${winname}-$(printf '%s' "$tcid" | tr -c 'A-Za-z0-9._-' '_')"
+    local tcid_s; tcid_s="$(printf '%s' "$tcid" | tr -c 'A-Za-z0-9._-' '_')"
+    [ "$tcid_s" != "$winname" ] && winname="${winname}-${tcid_s}"
   fi
   # nosync-wrap strips Claude's synchronized-output-mode sequences (CSI ?2026h/l) before tmux
   # sees them so scrolled-off lines reach native scrollback. Falls back to bare claude if absent.
@@ -334,6 +337,8 @@ t-claude() {
   # prefix on set-option's target: tested, it fails "no such session: =foo"; bare "$session" hits the
   # exact match when one exists.
   tmux set-option -t "$session" status off 2>/dev/null
+  tmux set-option -t "$session" set-titles on 2>/dev/null
+  tmux set-option -t "$session" set-titles-string "#{window_name}" 2>/dev/null
   tmux set-option -t "$session" mouse off 2>/dev/null
   tmux set-option -t "$session" history-limit 10000 2>/dev/null
   local overrides
@@ -364,6 +369,11 @@ t-claude() {
     # applied to the real session doesn't reach the view -- without this, a host with no
     # ~/.tmux.conf shows tmux's default green status bar in every t-claude terminal.
     tmux set-option -t "$view" status off 2>/dev/null
+    # Carry the tab label out to the enclosing terminal: the attached client's title becomes
+    # the window name (the --title label when one was given), so the cmux/ghostty window is
+    # named after the claude session it is showing.
+    tmux set-option -t "$view" set-titles on 2>/dev/null
+    tmux set-option -t "$view" set-titles-string "#{window_name}" 2>/dev/null
     tmux set-hook -t "$view" client-detached "kill-session -t $view" 2>/dev/null
     local widx; widx="$(tmux display-message -p -t "$win" '#{window_index}' 2>/dev/null)"
     [ -n "$widx" ] && tmux select-window -t "${view}:${widx}" 2>/dev/null
