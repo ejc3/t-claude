@@ -401,6 +401,12 @@ t-claude() {
   # older t-claude get labelled too. Then retitle the whole session (basename, extended on collision).
   tmux set-option -w -t "$win" @tclaude_path "$folder" 2>/dev/null
   tmux set-option -w -t "$win" @tclaude_resume "$tcid" 2>/dev/null
+  # The title-sync hook only acts on renames it can SEE in the session file, so stamp the
+  # file's path -- derivable only for uuid ids. "-" (not empty) for the rest: an empty
+  # #{q:@tclaude_file} would vanish from the hook's argument list and shift every arg after it.
+  local sfile="-"
+  _tclaude_is_uuid "$tcid" && sfile="$HOME/.claude/projects/$(printf '%s' "$folder" | tr -c 'A-Za-z0-9' '-')/${tcid}.jsonl"
+  tmux set-option -w -t "$win" @tclaude_file "$sfile" 2>/dev/null
   if [ -n "$title" ]; then tmux set-option -w -t "$win" @tclaude_title "$title" 2>/dev/null
   else tmux set-option -w -u -t "$win" @tclaude_title 2>/dev/null; fi
   _tclaude_relabel "$session"
@@ -418,34 +424,47 @@ t-claude() {
 
   # Follow claude's renames INSTANTLY: /rename updates claude's OSC title within a second
   # (measured; it never touches the tmux window name, so allow-rename can't help). A
-  # pane-title-changed hook feeds the new title through a helper that renames the window --
+  # pane-title-changed hook feeds the event through a helper that renames the window --
   # a helper FILE because tmux expands \${...} in hook strings as environment variables,
-  # so shell logic cannot live inline. The helper ignores untagged windows, shell/host junk
-  # (claude titles start with a status glyph), and the generic "Claude Code".
+  # so shell logic cannot live inline. The title change is only the TRIGGER, though: the
+  # name comes from the session file's latest custom-title line, the thing /rename writes.
+  # Claude also titles conversations on its own after the first message -- OSC only, no
+  # custom-title line -- and that must not rename a tab away from its explicit --title
+  # (it did: a foo-project tab turned into a summary of its first message).
   local tsync="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/title-sync.sh"
   mkdir -p "${tsync:h}" 2>/dev/null
   cat > "$tsync" <<'TSYNC'
 #!/bin/sh
-# args: window_id pane_title tclaude_key window_name  (written by t-claude; regenerated every launch)
-wid="$1"; title="$2"; key="$3"; cur="$4"
+# args: window_id pane_title tclaude_key session_file window_name  (written by t-claude; regenerated every launch)
+wid="$1"; title="$2"; key="$3"; file="$4"; cur="$5"
 [ -n "$key" ] || exit 0
 case "$title" in
-  [A-Za-z0-9]*) exit 0 ;;
+  [A-Za-z0-9]*) exit 0 ;;   # shell/host junk: claude titles start with a status glyph
   *" "*) ;;
   *) exit 0 ;;
 esac
-name="${title#* }"
-case "$name" in ""|"Claude Code") exit 0 ;; esac
-name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+# steady state: the window already shows what claude's title says (spinner frames re-fire
+# this hook constantly while claude works) -- skip the file read entirely
+osc="$(printf '%s' "${title#* }" | tr -c 'A-Za-z0-9._-' '_')"
+case "$cur" in "$osc"|"$osc"-*) exit 0 ;; esac
+# no session file, no verdict (also covers the arg shift if an old window lacks the option)
+case "$file" in /*) ;; *) exit 0 ;; esac
+[ -r "$file" ] || exit 0
+line="$(tail -c 4194304 "$file" 2>/dev/null | LC_ALL=C grep -aF '"type":"custom-title"' | tail -1)"
+[ -n "$line" ] || exit 0
+name="$(printf '%s' "$line" | LC_ALL=C grep -aoE '"customTitle":"(\\.|[^"\\])*"' | head -1)"
+name="${name#*:\"}"; name="${name%\"}"
+name="$(printf '%s' "$name" | sed -e 's/\\\(.\)/\1/g' | tr -c 'A-Za-z0-9._-' '_')"
 [ -n "$name" ] || exit 0
-[ "$name" = "$cur" ] && exit 0
+# "$name"-* : _tclaude_relabel may have added a tie-break suffix; leave its choice alone
+case "$cur" in "$name"|"$name"-*) exit 0 ;; esac
 tmux set-option -w -t "$wid" @tclaude_title "$name" 2>/dev/null
 tmux rename-window -t "$wid" "$name" 2>/dev/null
 exit 0
 TSYNC
   chmod +x "$tsync" 2>/dev/null
   tmux set-hook -t "$session" pane-title-changed \
-    "run-shell -b \"$tsync #{q:window_id} #{q:pane_title} #{q:@tclaude_key} #{q:window_name}\"" 2>/dev/null
+    "run-shell -b \"$tsync #{q:window_id} #{q:pane_title} #{q:@tclaude_key} #{q:@tclaude_file} #{q:window_name}\"" 2>/dev/null
   tmux set-option -t "$session" mouse off 2>/dev/null
   tmux set-option -t "$session" history-limit 10000 2>/dev/null
   local overrides
