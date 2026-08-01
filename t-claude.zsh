@@ -405,11 +405,14 @@ t-claude() {
     # detach viewers. The existence check is list-windows|grep: display-message accepts a
     # dead window id without complaint (measured on 3.7b), so it cannot be the predicate;
     # ## keeps the format literal through hook-time expansion.
-    # The command must NEVER exit nonzero or print: window-unlinked fires more than once
-    # per close, the second fire's kill-session fails on the already-dead view, and tmux
-    # surfaces any run-shell failure as a "returned 1" message pane on nearby clients.
+    # The command must NEVER exit nonzero or print (a failed run-shell becomes a "returned
+    # 1" message pane on nearby clients, and window-unlinked fires more than once per
+    # close). And it must DETACH the client rather than kill the view: killing a grouped
+    # session out from under its live client detaches the group's OTHER clients too
+    # (measured on 3.7b -- one /exit closed every tab). Detaching is ripple-free, and the
+    # client-detached hook above then reaps the view once it is clientless.
     tmux set-hook -t "$view" window-unlinked \
-      "run-shell -b \"tmux list-windows -a -F '##{window_id}' | grep -qx '$win' || tmux kill-session -t '$view' 2>/dev/null || true\"" 2>/dev/null
+      "run-shell -b \"tmux list-windows -a -F '##{window_id}' | grep -qx '$win' || tmux detach-client -s '$view' 2>/dev/null || true\"" 2>/dev/null
     # A grouped session shares windows but has its OWN session options, so the status-off
     # applied to the real session doesn't reach the view -- without this, a host with no
     # ~/.tmux.conf shows tmux's default green status bar in every t-claude terminal.
