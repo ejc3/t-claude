@@ -18,13 +18,19 @@ tmux SERVER  (one per machine)
         └── PANE  never touched by t-claude — split your own with Ctrl-b % / "
 ```
 
-- **SESSION** — the name you pass (`Apps`, `Backend`, `AWS`); omit it and it defaults to
-  `<folder>-<hash>`, unique per directory.
+- **SESSION** — the name you pass (`Apps`, `Backend`, `AWS`); omit it and everything
+  ungrouped shares one session, `main`.
 - **WINDOW** — one per project folder, keyed by the folder *path* (a hidden
   `@tclaude_key` option), so two same-named folders never collide, and the same folder in
   two sessions is two windows.
-- **`--resume <id>`** — opens a *new* window `<folder>-<id>` for a second conversation in
-  the same folder.
+- **`--resume <id>`** — opens a *new* window for a second conversation in the same folder,
+  named `<folder>-<id>` — unless the id already IS the label (`fb4a --resume fb4a` stays
+  `fb4a`); the suffix comes back automatically if two windows would otherwise read the same.
+  uuid-shaped ids key windows but never appear in names.
+- **`--title <label>`** — names the window (and so the terminal tab) `<label>` instead of
+  the folder basename.
+- **`--session-id <uuid>`** — like `--resume` for the window key, but starts the
+  conversation under a chosen id (see the header comment for how a wrapper uses this).
 - If a folder's window already exists in a **different** session, t-claude *moves* it to
   the session you asked for, live, without killing Claude.
 - Only windows t-claude created carry `@tclaude_key`, so your **manual windows are never**
@@ -90,14 +96,16 @@ silently discards stop signals sent to an orphaned process group.)
 
 ## Window title & notifications
 
-Claude sets a terminal title (OSC 0) as it works and rings the bell for attention. tmux only
-forwards a title to the outer terminal when `set-titles` is on, so without it the tab never
-picks up the rename — even though `nosync-wrap` passes the title through untouched.
-`set-titles on` with `set-titles-string "#{pane_title}"` forwards exactly what Claude set, so
-a rename inside Claude renames the terminal tab (and, over ssh through a terminal like cmux,
-the outer tab). `allow-passthrough on` lets OSC 9 / OSC 777 desktop notifications through and
-`monitor-bell` tracks the bell. These reach the focused pane's terminal; a bell in a
-background tmux window may only raise a tmux alert rather than a desktop notification.
+t-claude names the enclosing terminal tab after the tmux **window name** (the project label)
+by asserting `set-titles on` with `set-titles-string "#{window_name}"` on its sessions and
+attach views — so the tab reads `fb4a` or whatever `--title` said, and follows along when
+you switch windows. This deliberately overrides the `#{pane_title}` forwarding that
+tmux.conf.example ships for *non-t-claude* sessions, where the tab shows exactly what the
+running program set via OSC 0. `allow-passthrough on` lets OSC 9 / OSC 777 desktop
+notifications through and `monitor-bell` tracks the bell. These reach the focused pane's
+terminal; a bell in a background tmux window may only raise a tmux alert rather than a
+desktop notification. After the last window closes, tmux leaves the final title in place
+until your shell's next prompt rewrites it.
 
 ## Usage
 
@@ -106,6 +114,7 @@ cd ~/web-frontend && t-claude Apps                 # session Apps, window web-fr
 cd ~/mobile-app   && t-claude Apps                 # + window mobile-app (same session)
 cd ~/api-gateway  && t-claude Backend              # session Backend, window api-gateway
 cd ~/web-frontend && t-claude Apps --resume conv7  # 2nd window "web-frontend-conv7"
+cd ~/fb4a         && t-claude --resume fb4a        # window (and tab) just "fb4a"
 ```
 
 ## License

@@ -18,10 +18,10 @@ set -g mouse off
 # The terminal owns scrollback now; this is just a copy-mode fallback (Ctrl-b [ , q).
 set -g history-limit 10000
 
-# Let the running program's title and notifications reach the outer terminal, so a rename
-# inside Claude renames the terminal tab (and through cmux over ssh, the cmux tab). Claude
-# sets its title with OSC 0, and tmux only forwards a title to the terminal when set-titles
-# is on. The string is just the pane title, so the tab shows exactly what the program set.
+# Let the running program's title reach the outer terminal on plain (non-t-claude) tmux
+# use: Claude sets its title with OSC 0, and tmux only forwards a title when set-titles is
+# on. Note t-claude overrides this per-session with "#{window_name}", so its tabs are named
+# after the project window rather than whatever the program last set.
 set -g set-titles on
 set -g set-titles-string "#{pane_title}"
 

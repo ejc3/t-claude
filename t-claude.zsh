@@ -29,12 +29,14 @@
 # below. This makes the script self-contained: copy it to a fresh host with nothing but zsh
 # and tmux installed and scrollback works on the first run, no separate provisioning step.
 #
-# These are GLOBAL session options, so they apply to the whole tmux SERVER, not just the
-# window t-claude creates -- a plain `tmux` invoked later on the same server (no t-claude)
-# inherits them too, as long as t-claude has run at least once since that server started.
-# A hand-written ~/.tmux.conf can still coexist: it loads once at server start, t-claude's
-# settings are asserted after and win regardless of invocation order, so a stray or outdated
-# config file can no longer silently break scrollback.
+# Scope: status/mouse/history/set-titles are SESSION options asserted on t-claude's own
+# session (including a pre-existing session you named -- share a session with t-claude and
+# it manages these there); terminal-overrides is a SERVER option, so that one does apply to
+# the whole server. A hand-written ~/.tmux.conf can still coexist: it loads once at server
+# start, t-claude's settings are asserted after and win regardless of invocation order, so a
+# stray or outdated config file can no longer silently break scrollback. Note set-titles
+# pins the enclosing terminal's tab to the WINDOW NAME while attached (and tmux leaves the
+# last title behind after detach until the shell's next prompt rewrites it).
 #
 # THE MODEL (matches how cmux shows a tmux server: session -> left-sidebar entry, window ->
 # tab across the top, pane -> split inside a tab):
@@ -88,53 +90,67 @@ _tclaude_win_suffix() {
   print -r -- "${(j:/:)parts[n-k+1,n]}"
 }
 
-# Title every t-claude window in SESSION by folder basename, extending a colliding pair with
-# parent path components until unique -- so "bleh" stays "bleh" until a second "bleh" shows up,
-# then both become "apps/bleh", "core/bleh" (and deeper if still equal). The resume id is
-# appended and also disambiguates, so only same-basename + same-resume + different-folder pairs
-# ever grow. A window with an explicit @tclaude_title (from --title) shows that title verbatim
-# and never gets path-extended -- an explicit label is a choice, not a collision to repair.
-# Reads @tclaude_path / @tclaude_resume / @tclaude_title (stored per window); renames on change.
+# Title every t-claude window in SESSION. The label is the explicit --title when one was
+# given, else the folder basename, path-extended only when two windows would otherwise read
+# the same. A human --resume id is appended when it adds information: skipped when it IS the
+# label (fb4a stays fb4a), but brought back as the tiebreaker if that skip would leave two
+# windows identically named. uuid-shaped ids never label. All values are sanitized with the
+# same class the creation path uses, so the two naming sites agree.
 _tclaude_relabel() {
   emulate -L zsh
   local sess="$1"
-  local -a ids paths resumes titles
-  local id p r t
-  while IFS=$'\t' read -r id p r t; do
-    [ -n "$p" ] || continue
-    ids+=("$id"); paths+=("$p"); resumes+=("$r"); titles+=("$t")
-  done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{@tclaude_path}\t#{@tclaude_resume}\t#{@tclaude_title}' 2>/dev/null)
+  local -a ids paths resumes titles parts
+  local line
+  for line in "${(@f)$(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{@tclaude_path}\t#{@tclaude_resume}\t#{@tclaude_title}' 2>/dev/null)}"; do
+    # (@ps:\t:) keeps EMPTY fields; an IFS-tab read collapses adjacent tabs and shifts a
+    # title into the resume slot when @tclaude_resume is empty
+    parts=("${(@ps:\t:)line}")
+    [ -n "${parts[2]-}" ] || continue
+    ids+=("$parts[1]"); paths+=("$parts[2]")
+    resumes+=("$(printf '%s' "${parts[3]-}" | tr -c 'A-Za-z0-9._-' '_')")
+    titles+=("$(printf '%s' "${parts[4]-}" | tr -c 'A-Za-z0-9._-' '_')")
+  done
   integer n=$#ids
   (( n == 0 )) && return
-  integer -a kc; local -a disp; integer i j
+  local -a kc disp suf
+  integer i j
   for (( i=1; i<=n; i++ )); do
-    kc[$i]=1
-    if [ -n "$titles[$i]" ]; then disp[$i]="$titles[$i]"
-    else disp[$i]="$(_tclaude_win_suffix "$paths[$i]" 1)"; fi
+    kc[i]=1
+    if [ -n "$titles[$i]" ]; then disp[i]="$titles[$i]"
+    else disp[i]="$(printf '%s' "$(_tclaude_win_suffix "$paths[$i]" 1)" | tr -c 'A-Za-z0-9._/-' '_')"; fi
+    if [ -n "$resumes[$i]" ] && ! _tclaude_is_uuid "$resumes[$i]" && [ "$resumes[$i]" != "$disp[$i]" ]; then
+      suf[i]="$resumes[$i]"
+    else
+      suf[i]=""
+    fi
   done
   integer changed=1 guard=0
   while (( changed )) && (( guard < 64 )); do
     changed=0; (( guard++ ))
     for (( i=1; i<=n; i++ )); do
       for (( j=i+1; j<=n; j++ )); do
-        if [[ "$disp[$i]" == "$disp[$j]" && "$resumes[$i]" == "$resumes[$j]" ]]; then
-          integer ni=$(( kc[$i]+1 )) nj=$(( kc[$j]+1 ))
+        [[ "$disp[$i]${suf[$i]:+-$suf[$i]}" == "$disp[$j]${suf[$j]:+-$suf[$j]}" ]] || continue
+        if [[ "$resumes[$i]" != "$resumes[$j]" ]]; then
+          # differing ids separate the pair even when an id equals the label: a plain fb4a
+          # window and a --resume fb4a window become fb4a and fb4a-fb4a
+          if [ -n "$resumes[$i]" ] && [ "$suf[$i]" != "$resumes[$i]" ]; then suf[i]="$resumes[$i]"; changed=1; fi
+          if [ -n "$resumes[$j]" ] && [ "$suf[$j]" != "$resumes[$j]" ]; then suf[j]="$resumes[$j]"; changed=1; fi
+        else
+          integer ni=$(( kc[i]+1 )) nj=$(( kc[j]+1 ))
           if [ -z "$titles[$i]" ]; then
-            local si="$(_tclaude_win_suffix "$paths[$i]" $ni)"
-            [[ "$si" != "$disp[$i]" ]] && { kc[$i]=$ni; disp[$i]="$si"; changed=1 }
+            local si="$(printf '%s' "$(_tclaude_win_suffix "$paths[$i]" $ni)" | tr -c 'A-Za-z0-9._/-' '_')"
+            [[ "$si" != "$disp[$i]" ]] && { kc[i]=$ni; disp[i]="$si"; changed=1 }
           fi
           if [ -z "$titles[$j]" ]; then
-            local sj="$(_tclaude_win_suffix "$paths[$j]" $nj)"
-            [[ "$sj" != "$disp[$j]" ]] && { kc[$j]=$nj; disp[$j]="$sj"; changed=1 }
+            local sj="$(printf '%s' "$(_tclaude_win_suffix "$paths[$j]" $nj)" | tr -c 'A-Za-z0-9._/-' '_')"
+            [[ "$sj" != "$disp[$j]" ]] && { kc[j]=$nj; disp[j]="$sj"; changed=1 }
           fi
         fi
       done
     done
   done
   for (( i=1; i<=n; i++ )); do
-    local name="$disp[$i]"
-    if [ -n "$resumes[$i]" ] && ! _tclaude_is_uuid "$resumes[$i]" && [ "$resumes[$i]" != "$name" ]; then name="${name}-${resumes[$i]}"; fi
-    name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._/-' '_')"   # keep / . _ - ; no ':' (breaks targets)
+    local name="$disp[$i]${suf[$i]:+-$suf[$i]}"
     local cur; cur="$(tmux display-message -p -t "$ids[$i]" '#{window_name}' 2>/dev/null)"
     [[ "$cur" == "$name" ]] || tmux rename-window -t "$ids[$i]" "$name" 2>/dev/null
   done
@@ -235,8 +251,8 @@ t-claude() {
     extra=" ${qpass[*]}"
   fi
   local inner
-  if [ -n "$resume" ]; then inner="${wrap}claude --resume $resume $flags$extra"
-  elif [ -n "$sid" ]; then inner="${wrap}claude --session-id $sid $flags$extra"
+  if [ -n "$resume" ]; then inner="${wrap}claude --resume ${(q)resume} $flags$extra"
+  elif [ -n "$sid" ]; then inner="${wrap}claude --session-id ${(q)sid} $flags$extra"
   else inner="${wrap}claude --resume $flags$extra"; fi
 
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
@@ -287,6 +303,12 @@ t-claude() {
       tmux new-session -d -s "$session" -n "$winname" -c "$folder"
       win="$(tmux list-windows -t "=$session" -F '#{window_id}' | head -1)"
     fi
+    if [ -z "$win" ]; then
+      # never fall through with an empty target: tmux resolves it to the CURRENT window and
+      # the launch line (ending "&& exit") would be typed into whatever the user is doing
+      printf "t-claude: could not create a window in session '%s'\n" "$session" >&2
+      return 1
+    fi
     tmux set-option -w -t "$win" @tclaude_key "$key"
     tmux send-keys -t "$win" "$cmd" Enter
     created=1
@@ -301,10 +323,14 @@ t-claude() {
     local pane_pid kid alive=0
     pane_pid="$(tmux display-message -p -t "$win" '#{pane_pid}' 2>/dev/null)"
     if [ -n "$pane_pid" ]; then
+      local kcmd
       for kid in $(pgrep -P "$pane_pid" 2>/dev/null); do
-        case "$(ps -o command= -p "$kid" 2>/dev/null)" in
-          *claude*|*nosync-wrap*) alive=1; break ;;
-        esac
+        kcmd="$(ps -o command= -p "$kid" 2>/dev/null)"
+        # match the job we launch (claude, or the nosync-wrap shim running claude) -- NOT any
+        # argv that merely mentions a path with "claude" in it (less ~/src/t-claude/... is
+        # not a running claude)
+        case "${${kcmd%% *}:t}" in claude) alive=1; break ;; esac
+        case "$kcmd" in *"nosync-wrap claude"*) alive=1; break ;; esac
       done
       if [ "$alive" = 0 ]; then
         # A killed claude leaves its terminal modes latched on the pane -- focus-reporting
@@ -351,9 +377,11 @@ t-claude() {
   # session's windows but has its own current-window pointer, so several tabs show different windows
   # at once with no mirroring, and `attach -d` on one view can't cross-detach another. A
   # client-detached hook destroys the view when the tab closes; the start-of-run reap is the backstop.
+  local widx
+  widx="$(tmux list-windows -t "=$session" -F $'#{window_id}\t#{window_index}' 2>/dev/null | awk -F'\t' -v w="$win" '$1==w{print $2; exit}')"
   if [ -n "${TMUX-}" ]; then
-    tmux select-window -t "$win" 2>/dev/null
     tmux switch-client -t "=$session"
+    [ -n "$widx" ] && tmux select-window -t "=${session}:${widx}" 2>/dev/null
   else
     # Replay scrollback above the visible screen before attaching -- tmux repaints only the visible
     # pane on attach, so native scrollback would otherwise start empty. capture-pane -S - -E -1 dumps
@@ -375,7 +403,6 @@ t-claude() {
     tmux set-option -t "$view" set-titles on 2>/dev/null
     tmux set-option -t "$view" set-titles-string "#{window_name}" 2>/dev/null
     tmux set-hook -t "$view" client-detached "kill-session -t $view" 2>/dev/null
-    local widx; widx="$(tmux display-message -p -t "$win" '#{window_index}' 2>/dev/null)"
     [ -n "$widx" ] && tmux select-window -t "${view}:${widx}" 2>/dev/null
     tmux attach -d -t "=$view"
   fi
