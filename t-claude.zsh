@@ -401,12 +401,6 @@ t-claude() {
   # older t-claude get labelled too. Then retitle the whole session (basename, extended on collision).
   tmux set-option -w -t "$win" @tclaude_path "$folder" 2>/dev/null
   tmux set-option -w -t "$win" @tclaude_resume "$tcid" 2>/dev/null
-  # The title-sync hook only acts on renames it can SEE in the session file, so stamp the
-  # file's path -- derivable only for uuid ids. "-" (not empty) for the rest: an empty
-  # #{q:@tclaude_file} would vanish from the hook's argument list and shift every arg after it.
-  local sfile="-"
-  _tclaude_is_uuid "$tcid" && sfile="$HOME/.claude/projects/$(printf '%s' "$folder" | tr -c 'A-Za-z0-9' '-')/${tcid}.jsonl"
-  tmux set-option -w -t "$win" @tclaude_file "$sfile" 2>/dev/null
   if [ -n "$title" ]; then tmux set-option -w -t "$win" @tclaude_title "$title" 2>/dev/null
   else tmux set-option -w -u -t "$win" @tclaude_title 2>/dev/null; fi
   _tclaude_relabel "$session"
@@ -435,8 +429,8 @@ t-claude() {
   mkdir -p "${tsync:h}" 2>/dev/null
   cat > "$tsync" <<'TSYNC'
 #!/bin/sh
-# args: window_id pane_title tclaude_key session_file window_name  (written by t-claude; regenerated every launch)
-wid="$1"; title="$2"; key="$3"; file="$4"; cur="$5"
+# args: window_id pane_title tclaude_key resume_id pane_path window_name  (written by t-claude; regenerated every launch)
+wid="$1"; title="$2"; key="$3"; rid="$4"; ppath="$5"; cur="$6"
 [ -n "$key" ] || exit 0
 case "$title" in
   [A-Za-z0-9]*) exit 0 ;;   # shell/host junk: claude titles start with a status glyph
@@ -444,11 +438,17 @@ case "$title" in
   *) exit 0 ;;
 esac
 # steady state: the window already shows what claude's title says (spinner frames re-fire
-# this hook constantly while claude works) -- skip the file read entirely
+# this hook constantly while claude works) -- skip the file work entirely
 osc="$(printf '%s' "${title#* }" | tr -c 'A-Za-z0-9._-' '_')"
 case "$cur" in "$osc"|"$osc"-*) exit 0 ;; esac
-# no session file, no verdict (also covers the arg shift if an old window lacks the option)
-case "$file" in /*) ;; *) exit 0 ;; esac
+# The session file is derived HERE, from the pane's live cwd, not stamped at launch:
+# claude's /cd moves the conversation to another projects dir, and a launch-time path
+# would keep reading the abandoned copy. Both checks also cover the argument shift a
+# window with an empty @tclaude_resume would cause (#{q:} on "" expands to nothing).
+case "$rid" in ????????-????-????-????-????????????) ;; *) exit 0 ;; esac
+[ -z "$(printf '%s' "$rid" | tr -d '0-9a-fA-F-')" ] || exit 0
+case "$ppath" in /*) ;; *) exit 0 ;; esac
+file="$HOME/.claude/projects/$(printf '%s' "$ppath" | tr -c 'A-Za-z0-9' '-')/$rid.jsonl"
 [ -r "$file" ] || exit 0
 line="$(tail -c 4194304 "$file" 2>/dev/null | LC_ALL=C grep -aF '"type":"custom-title"' | tail -1)"
 [ -n "$line" ] || exit 0
@@ -463,8 +463,16 @@ tmux rename-window -t "$wid" "$name" 2>/dev/null
 exit 0
 TSYNC
   chmod +x "$tsync" 2>/dev/null
-  tmux set-hook -t "$session" pane-title-changed \
-    "run-shell -b \"$tsync #{q:window_id} #{q:pane_title} #{q:@tclaude_key} #{q:@tclaude_file} #{q:window_name}\"" 2>/dev/null
+  # GLOBAL, not per-session (measured on a live server): when a window is displayed
+  # through a grouped view -- which is how every t-claude client attaches -- tmux runs
+  # pane-title-changed in the VIEW session's context, so a hook on the home session
+  # never fires. Views are ephemeral (created per attach), so hooking them doesn't
+  # stick either. The global hook fires in every context; the @tclaude_key guard in
+  # the helper makes it a no-op for windows t-claude didn't create. One launch from
+  # any current shell wires the whole server, windows made by stale shells included
+  # (@tclaude_resume is stamped on every generation's windows).
+  tmux set-hook -g pane-title-changed \
+    "run-shell -b \"$tsync #{q:window_id} #{q:pane_title} #{q:@tclaude_key} #{q:@tclaude_resume} #{q:pane_current_path} #{q:window_name}\"" 2>/dev/null
   tmux set-option -t "$session" mouse off 2>/dev/null
   tmux set-option -t "$session" history-limit 10000 2>/dev/null
   local overrides
