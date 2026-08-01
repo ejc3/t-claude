@@ -172,6 +172,22 @@ t-claude() {
   # The physical path is the same string however you got there.
   folder="${PWD:A}"
 
+  # Self-heal hooks on EXISTING views: a shell that sourced an older t-claude writes an
+  # older window-unlinked hook onto the views it creates, and one stale view in the group
+  # can misbehave for every tab (the kill-session generation detached sibling clients).
+  # Every launch rewrites live views' hooks to the current generation, so upgrades take
+  # effect without every shell re-sourcing.
+  local hv hh hw
+  for hv in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '__tcv__' 2>/dev/null); do
+    hh="$(tmux show-hooks -t "$hv" 2>/dev/null | grep -m1 window-unlinked)"
+    [ -n "$hh" ] || continue
+    hw="${${hh#*grep -qx \'}%%\'*}"
+    case "$hw" in
+      @*) tmux set-hook -t "$hv" window-unlinked \
+            "run-shell -b \"tmux list-windows -a -F '##{window_id}' | grep -qx '$hw' || tmux detach-client -s '$hv' 2>/dev/null || true\"" 2>/dev/null ;;
+    esac
+  done
+
   # Reap our own stale grouped views: sessions we made (name ends "__tcv__<digits>") with no
   # attached client, left behind if a client died without the client-detached hook firing. Two
   # guards: match only that exact suffix (so a user session merely containing "__tcv__" is never
