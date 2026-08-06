@@ -190,6 +190,42 @@ _tclaude_relabel() {
   done
 }
 
+# Create a grouped view of SESSION parked for WIN and print its name. A view shares the
+# session's windows but has its own current-window pointer, which is what lets each tab
+# show a different window. The hooks and options are load-bearing; their reasons are in
+# the comments below.
+_tclaude_mint_view() {
+  local session="$1" win="$2"
+  local view="${session}__tcv__${$}${RANDOM}"
+  tmux new-session -d -t "=$session" -s "$view" 2>/dev/null
+  # This view exists to show ONE window. When that window ceases to exist (claude /exits
+  # and the launch line closes it), kill the view so the client detaches all the way back
+  # to the shell -- without this, tmux parks the client on a neighboring window instead.
+  # A window MOVED to another session still exists server-wide, so regrouping does not
+  # detach viewers. The existence check is list-windows|grep: display-message accepts a
+  # dead window id without complaint (measured on 3.7b), so it cannot be the predicate;
+  # ## keeps the format literal through hook-time expansion.
+  # The command must NEVER exit nonzero or print (a failed run-shell becomes a "returned
+  # 1" message pane on nearby clients, and window-unlinked fires more than once per
+  # close). And it must DETACH the client rather than kill the view: killing a grouped
+  # session out from under its live client detaches the group's OTHER clients too
+  # (measured on 3.7b -- one /exit closed every tab). Detaching is ripple-free, and the
+  # client-detached hook below then reaps the view once it is clientless.
+  tmux set-hook -t "$view" window-unlinked \
+    "run-shell -b \"tmux list-windows -a -F '##{window_id}' | grep -qx '$win' || tmux detach-client -s '$view' 2>/dev/null || true\"" 2>/dev/null
+  # A grouped session shares windows but has its OWN session options, so the status-off
+  # applied to the real session doesn't reach the view -- without this, a host with no
+  # ~/.tmux.conf shows tmux's default green status bar in every t-claude terminal.
+  tmux set-option -t "$view" status off 2>/dev/null
+  # Carry the tab label out to the enclosing terminal: the attached client's title becomes
+  # the window name (the --title label when one was given), so the cmux/ghostty window is
+  # named after the claude session it is showing.
+  tmux set-option -t "$view" set-titles on 2>/dev/null
+  tmux set-option -t "$view" set-titles-string "#{window_name}" 2>/dev/null
+  tmux set-hook -t "$view" client-detached "kill-session -t $view" 2>/dev/null
+  printf '%s\n' "$view"
+}
+
 t-claude() {
   local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0
   local -a passthrough
@@ -577,8 +613,24 @@ TSYNC
   local widx
   widx="$(tmux list-windows -t "=$session" -F $'#{window_id}\t#{window_index}' 2>/dev/null | awk -F'\t' -v w="$win" '$1==w{print $2; exit}')"
   if [ -n "${TMUX-}" ]; then
-    tmux switch-client -t "=$session"
-    [ -n "$widx" ] && tmux select-window -t "=${session}:${widx}" 2>/dev/null
+    # Never park a client on the real session: every client attached to $session itself
+    # shares its single current-window pointer, so two tabs that each ran this from inside
+    # tmux would change windows in lockstep from then on. A client already on one of this
+    # session's views keeps that view; any other client gets a fresh view, the same
+    # isolation the bare-terminal path has always used.
+    local cur
+    cur="$(tmux display-message -p '#{client_session}' 2>/dev/null)"
+    case "$cur" in
+      "${session}__tcv__"*)
+        [ -n "$widx" ] && tmux select-window -t "=${cur}:${widx}" 2>/dev/null
+        ;;
+      *)
+        local view
+        view="$(_tclaude_mint_view "$session" "$win")"
+        [ -n "$widx" ] && tmux select-window -t "${view}:${widx}" 2>/dev/null
+        tmux switch-client -t "=$view"
+        ;;
+    esac
   else
     # Replay scrollback above the visible screen before attaching -- tmux repaints only the visible
     # pane on attach, so native scrollback would otherwise start empty. capture-pane -S - -E -1 dumps
@@ -588,33 +640,8 @@ TSYNC
     if [ -n "$hist" ] && [ "$hist" -gt 0 ] 2>/dev/null; then
       tmux capture-pane -p -e -S - -E -1 -t "$win" 2>/dev/null
     fi
-    local view="${session}__tcv__${$}${RANDOM}"
-    tmux new-session -d -t "=$session" -s "$view" 2>/dev/null
-    # This view exists to show ONE window. When that window ceases to exist (claude /exits
-    # and the launch line closes it), kill the view so the client detaches all the way back
-    # to the shell -- without this, tmux parks the client on a neighboring window instead.
-    # A window MOVED to another session still exists server-wide, so regrouping does not
-    # detach viewers. The existence check is list-windows|grep: display-message accepts a
-    # dead window id without complaint (measured on 3.7b), so it cannot be the predicate;
-    # ## keeps the format literal through hook-time expansion.
-    # The command must NEVER exit nonzero or print (a failed run-shell becomes a "returned
-    # 1" message pane on nearby clients, and window-unlinked fires more than once per
-    # close). And it must DETACH the client rather than kill the view: killing a grouped
-    # session out from under its live client detaches the group's OTHER clients too
-    # (measured on 3.7b -- one /exit closed every tab). Detaching is ripple-free, and the
-    # client-detached hook above then reaps the view once it is clientless.
-    tmux set-hook -t "$view" window-unlinked \
-      "run-shell -b \"tmux list-windows -a -F '##{window_id}' | grep -qx '$win' || tmux detach-client -s '$view' 2>/dev/null || true\"" 2>/dev/null
-    # A grouped session shares windows but has its OWN session options, so the status-off
-    # applied to the real session doesn't reach the view -- without this, a host with no
-    # ~/.tmux.conf shows tmux's default green status bar in every t-claude terminal.
-    tmux set-option -t "$view" status off 2>/dev/null
-    # Carry the tab label out to the enclosing terminal: the attached client's title becomes
-    # the window name (the --title label when one was given), so the cmux/ghostty window is
-    # named after the claude session it is showing.
-    tmux set-option -t "$view" set-titles on 2>/dev/null
-    tmux set-option -t "$view" set-titles-string "#{window_name}" 2>/dev/null
-    tmux set-hook -t "$view" client-detached "kill-session -t $view" 2>/dev/null
+    local view
+    view="$(_tclaude_mint_view "$session" "$win")"
     [ -n "$widx" ] && tmux select-window -t "${view}:${widx}" 2>/dev/null
     tmux attach -d -t "=$view"
   fi
