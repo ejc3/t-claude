@@ -429,7 +429,13 @@ HOOKSJSON
   # shell tab behind. It stays out of the way everywhere else: Ctrl-Z makes the job's status
   # 148, so `exit` is skipped and the shell is there for fg; a crash exits nonzero, so the
   # shell (and the error) stay visible too.
-  cmd=" $inner && exit"
+  # The window's shell is trusted for nothing, not even its working directory: a shell
+  # whose cwd sits on a filesystem that was remounted (network mounts drop and come back)
+  # holds a dead directory handle, getcwd fails with "Transport endpoint is not connected",
+  # and anything launched from it dies on process.cwd. cd by absolute path re-resolves
+  # through the live mount, healing such a shell; in a fresh window it is a no-op. If even
+  # the cd fails the launch stops there and the shell stays for the error.
+  cmd=" cd -- ${(q)folder} && $inner && exit"
 
   # already the requested session's window?
   win=""
