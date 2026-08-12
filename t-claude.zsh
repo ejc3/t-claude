@@ -416,10 +416,30 @@ HOOKSJSON
     local -a qpass; qpass=("${(@q)passthrough}")
     extra=" ${qpass[*]}"
   fi
+  # A bare `--resume` (no id) opens claude's session PICKER. In a project claude has
+  # never run in, that picker has nothing to list: it renders "No conversations found
+  # in this project" and waits for a keypress. Interactively that is a pointless extra
+  # keystroke; under automation -- the boot launcher starting sessions with
+  # --remote-control and no terminal attached -- nobody ever sends that key, so claude
+  # never finishes starting and never registers with remote control. It looks alive in
+  # tmux while being permanently wedged (11 sessions on one host, 2026-08-12).
+  #
+  # When there IS history, use --continue (resume the most recent conversation
+  # directly) rather than a bare --resume: --continue never renders a picker, so it is
+  # safe without a terminal, and it preserves continuity instead of silently starting a
+  # fresh conversation in a project that had one. claude keeps per-project
+  # transcripts in ~/.claude/projects/<abs path with '/' -> '-'>/*.jsonl; no transcript
+  # means a bare --resume can only ever produce the empty picker. An explicit --resume
+  # <id> or --session-id from the caller is always honoured -- this only governs the
+  # implicit case.
+  local projdir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${folder//\//-}"
+  local -a _hist; _hist=("$projdir"/*.jsonl(N))
+
   local inner
   if [ -n "$resume" ]; then inner="${wrap}claude --resume ${(q)resume} $flags$hooks_flag$extra"
   elif [ -n "$sid" ]; then inner="${wrap}claude --session-id ${(q)sid} $flags$hooks_flag$extra"
-  else inner="${wrap}claude --resume $flags$hooks_flag$extra"; fi
+  elif (( ${#_hist} )); then inner="${wrap}claude --continue $flags$hooks_flag$extra"
+  else inner="${wrap}claude $flags$hooks_flag$extra"; fi
 
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
   # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
