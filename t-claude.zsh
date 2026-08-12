@@ -227,7 +227,7 @@ _tclaude_mint_view() {
 }
 
 t-claude() {
-  local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0
+  local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
   # identity is keyed off this, and $PWD is not stable for one directory: on many setups
@@ -278,6 +278,7 @@ t-claude() {
   # or not, is collected in order and handed to claude verbatim.
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --auto) auto=1; shift ;;
       --resume=*) resume="${1#--resume=}"; shift ;;
       --resume)
         if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then resume="$2"; shift 2; else shift; fi ;;
@@ -424,10 +425,15 @@ HOOKSJSON
   # never finishes starting and never registers with remote control. It looks alive in
   # tmux while being permanently wedged (11 sessions on one host, 2026-08-12).
   #
-  # When there IS history, use --continue (resume the most recent conversation
-  # directly) rather than a bare --resume: --continue never renders a picker, so it is
-  # safe without a terminal, and it preserves continuity instead of silently starting a
-  # fresh conversation in a project that had one. claude keeps per-project
+  # --auto is for callers with no human at the keyboard (the boot launcher, which runs
+  # under systemd with no terminal). Only they get --continue; an interactive t-claude
+  # keeps the bare --resume picker, which is how you reach a session filed under a
+  # DIFFERENT project than the one you are standing in -- claude files a transcript
+  # under the directory the session STARTED in, so a long-running session that later
+  # cd'd elsewhere is only reachable through the picker's "all projects" view.
+  #
+  # Under --auto: --continue when this project has transcripts (resumes the most recent
+  # directly, no picker, continuity preserved), plain claude when it has none. claude keeps per-project
   # transcripts in ~/.claude/projects/<abs path with '/' -> '-'>/*.jsonl; no transcript
   # means a bare --resume can only ever produce the empty picker. An explicit --resume
   # <id> or --session-id from the caller is always honoured -- this only governs the
@@ -438,8 +444,9 @@ HOOKSJSON
   local inner
   if [ -n "$resume" ]; then inner="${wrap}claude --resume ${(q)resume} $flags$hooks_flag$extra"
   elif [ -n "$sid" ]; then inner="${wrap}claude --session-id ${(q)sid} $flags$hooks_flag$extra"
-  elif (( ${#_hist} )); then inner="${wrap}claude --continue $flags$hooks_flag$extra"
-  else inner="${wrap}claude $flags$hooks_flag$extra"; fi
+  elif (( auto )) && (( ${#_hist} )); then inner="${wrap}claude --continue $flags$hooks_flag$extra"
+  elif (( auto )); then inner="${wrap}claude $flags$hooks_flag$extra"
+  else inner="${wrap}claude --resume $flags$hooks_flag$extra"; fi
 
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
   # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
