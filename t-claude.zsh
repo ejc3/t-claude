@@ -412,6 +412,25 @@ HOOKSJSON
   # not the whole array quoted as one blob, which collapses to a single argument. Verified
   # round-trip on values with spaces, "=", and shell metacharacters, since this string is
   # ultimately typed into a live shell via tmux send-keys.
+  # TCLAUDE_ARGS: per-user defaults, applied to every launch. Set it in your shell rc, e.g.
+  #   export TCLAUDE_ARGS="--remote-control"
+  # so an interactive session is reachable the same way the managed boot unit's is. Without
+  # it, only agents-start passes --remote-control, so the FIRST session a new user starts --
+  # the one they log in with -- is the one that is not remote-controllable, and t-claude will
+  # not fix it later: a live claude is selected, never relaunched.
+  #
+  # Explicit arguments win: a flag already given on the command line is not added again, so
+  # `t-claude --remote-control` (what agents-start runs) does not end up passing it twice.
+  local -a defaults; defaults=(${=TCLAUDE_ARGS:-})
+  local d dseen
+  for d in $defaults; do
+    dseen=0
+    for pel in $passthrough; do
+      [[ "$pel" == "$d" || "$pel" == "$d="* ]] && { dseen=1; break }
+    done
+    (( dseen )) || passthrough+=("$d")
+  done
+
   local extra=""
   if [ "${#passthrough[@]}" -gt 0 ]; then
     local -a qpass; qpass=("${(@q)passthrough}")
