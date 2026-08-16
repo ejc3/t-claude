@@ -438,6 +438,12 @@ HOOKSJSON
   # means a bare --resume can only ever produce the empty picker. An explicit --resume
   # <id> or --session-id from the caller is always honoured -- this only governs the
   # implicit case.
+  #
+  # The no-transcript guard applies WITHOUT --auto too. Interactively the picker is the
+  # point, but only when there is something to pick: on a first run -- a new account, or any
+  # project nobody has opened here yet -- `claude --resume` can only show an empty picker,
+  # so the first thing a new user meets is a dead end. Plain `claude` is what they want
+  # there, and it is also what performs the initial Anthropic sign-in.
   local projdir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${folder//\//-}"
   local -a _hist; _hist=("$projdir"/*.jsonl(N))
 
@@ -446,7 +452,8 @@ HOOKSJSON
   elif [ -n "$sid" ]; then inner="${wrap}claude --session-id ${(q)sid} $flags$hooks_flag$extra"
   elif (( auto )) && (( ${#_hist} )); then inner="${wrap}claude --continue $flags$hooks_flag$extra"
   elif (( auto )); then inner="${wrap}claude $flags$hooks_flag$extra"
-  else inner="${wrap}claude --resume $flags$hooks_flag$extra"; fi
+  elif (( ${#_hist} )); then inner="${wrap}claude --resume $flags$hooks_flag$extra"
+  else inner="${wrap}claude $flags$hooks_flag$extra"; fi
 
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
   # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
