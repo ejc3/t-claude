@@ -688,6 +688,12 @@ TSYNC
   # without it the raw move-window still works, it just does not follow. prefix-B: fork
   # the pane's claude via key-branch; without the file the key is a no-op.
   local khooks="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude"
+  # Topology journal: window create/move/close events feed an optional hook (same seam
+  # as branch-hook) so a wrapper can keep a restorable record with tmux as the source of
+  # truth. Session-scoped window-unlinked hooks (the grouped views') shadow the global
+  # one in their own context, which is fine -- view churn is not topology.
+  tmux set-hook -g window-linked "run-shell -b \"[ -x ${(q)khooks}/topology-snap ] && ${(q)khooks}/topology-snap #{q:socket_path} || true\"" 2>/dev/null
+  tmux set-hook -g window-unlinked "run-shell -b \"[ -x ${(q)khooks}/topology-snap ] && ${(q)khooks}/topology-snap #{q:socket_path} || true\"" 2>/dev/null
   tmux bind-key M choose-tree -Zs "run-shell -b \"if [ -x ${(q)khooks}/key-move ]; then ${(q)khooks}/key-move '#{socket_path}' '#{pane_id}' '%%'; else tmux move-window -s '#{window_id}' -t '%%:'; fi\"" 2>/dev/null
   tmux bind-key B run-shell -b "[ -x ${(q)khooks}/key-branch ] && ${(q)khooks}/key-branch #{q:socket_path} #{q:pane_id} || true" 2>/dev/null
   local overrides
