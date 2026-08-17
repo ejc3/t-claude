@@ -34,7 +34,10 @@
 # it manages these there); terminal-overrides is a SERVER option, so that one does apply to
 # the whole server. A hand-written ~/.tmux.conf can still coexist: it loads once at server
 # start, t-claude's settings are asserted after and win regardless of invocation order, so a
-# stray or outdated config file can no longer silently break scrollback. Note set-titles
+# stray or outdated config file can no longer silently break scrollback. Two key bindings
+# (prefix-M move-to-group, prefix-B fork-pane) are asserted server-wide the same way, and
+# they are the one exception to the "manual windows are never touched" rule below: a key
+# the user presses acts on whatever window they pressed it in. Note set-titles
 # pins the enclosing terminal's tab to the WINDOW NAME while attached (and tmux leaves the
 # last title behind after detach until the shell's next prompt rewrites it).
 #
@@ -227,6 +230,20 @@ _tclaude_mint_view() {
 }
 
 t-claude() {
+  # Function-snapshot shells (zsh snapshots like claude's ! bash mode) can carry t-claude
+  # without its helpers; re-source the file from wherever this host keeps it. Proceeding
+  # helper-less would be worse than failing: _tclaude_is_uuid would "fail" on every uuid
+  # and the managed flag below would be stripped from managed windows.
+  if [ -z "${functions[_tclaude_is_uuid]-}" ]; then
+    local _theal
+    for _theal in "$HOME/.config/t-claude.zsh" /usr/local/lib/fcvm/t-claude.zsh "$HOME/.config/fcvm-t-claude.zsh"; do
+      [ -f "$_theal" ] && source "$_theal" && break
+    done
+    if [ -z "${functions[_tclaude_is_uuid]-}" ]; then
+      printf 't-claude: helper functions missing and no source file found to reload\n' >&2
+      return 1
+    fi
+  fi
   local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
@@ -662,6 +679,17 @@ TSYNC
     "run-shell -b \"$tsync #{q:window_id} #{q:pane_title} #{q:@tclaude_key} #{q:@tclaude_resume} #{q:pane_current_path} #{q:window_name}\"" 2>/dev/null
   tmux set-option -t "$session" mouse off 2>/dev/null
   tmux set-option -t "$session" history-limit 10000 2>/dev/null
+  # Two keys, asserted at runtime like everything else so a fresh host has them with no
+  # tmux.conf (they are SERVER-wide, like terminal-overrides; prefix-M replaces the stock
+  # M, clear marked pane, which is also on m). Both act through optional hook files a
+  # wrapper installs -- the same extension seam as branch-hook; t-claude names no workflow
+  # of its own. prefix-M: move the current window to the session picked in the tree; the
+  # key-move hook validates the pick and walks watching clients along (c-claude -g), and
+  # without it the raw move-window still works, it just does not follow. prefix-B: fork
+  # the pane's claude via key-branch; without the file the key is a no-op.
+  local khooks="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude"
+  tmux bind-key M choose-tree -Zs "run-shell -b \"if [ -x ${(q)khooks}/key-move ]; then ${(q)khooks}/key-move '#{socket_path}' '#{pane_id}' '%%'; else tmux move-window -s '#{window_id}' -t '%%:'; fi\"" 2>/dev/null
+  tmux bind-key B run-shell -b "[ -x ${(q)khooks}/key-branch ] && ${(q)khooks}/key-branch #{q:socket_path} #{q:pane_id} || true" 2>/dev/null
   local overrides
   overrides="$(tmux show-options -gv terminal-overrides 2>/dev/null)"
   case "$overrides" in *'smcup@:rmcup@'*) ;; *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;; esac
@@ -672,6 +700,13 @@ TSYNC
   # session's windows but has its own current-window pointer, so several tabs show different windows
   # at once with no mirroring, and `attach -d` on one view can't cross-detach another. A
   # client-detached hook destroys the view when the tab closes; the start-of-run reap is the backstop.
+  # No tty means no human to hand the window to: a fleet bring-up, a claude ! bash-mode
+  # invocation, or a hook is driving. The window is created/updated above; attaching (or
+  # yanking the caller's client to a new view) would be wrong, so stop here.
+  if ! [ -t 0 ]; then
+    printf 'window %s ready in session %s (not attaching: no terminal)\n' "$winname" "$session" >&2
+    return 0
+  fi
   local widx
   widx="$(tmux list-windows -t "=$session" -F $'#{window_id}\t#{window_index}' 2>/dev/null | awk -F'\t' -v w="$win" '$1==w{print $2; exit}')"
   if [ -n "${TMUX-}" ]; then
