@@ -478,17 +478,20 @@ HOOKSJSON
   # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
   # discards stop signals). Leading space keeps the launch line out of history (HIST_IGNORE_SPACE).
   #
-  # `&& exit` closes the window when claude exits CLEANLY (/exit) instead of leaving an empty
-  # shell tab behind. It stays out of the way everywhere else: Ctrl-Z makes the job's status
-  # 148, so `exit` is skipped and the shell is there for fg; a crash exits nonzero, so the
-  # shell (and the error) stay visible too.
+  # The status check after claude decides whether the window lives on. A clean /exit (0)
+  # closes it instead of leaving an empty shell tab behind -- and so does a signal death
+  # (status > 128: an OOM kill, SIGKILL, SIGTERM, a segfault), which should read the same
+  # as /exit rather than dropping the user at a bare prompt in a dead tab. Two cases keep
+  # the shell: a stop status (145-148 covers SIGSTOP/SIGTSTP on both Darwin's and Linux's
+  # numbering), because Ctrl-Z needs the shell there for fg; and a plain nonzero exit
+  # (1-128), because that is claude refusing to start and the error must stay readable.
   # The window's shell is trusted for nothing, not even its working directory: a shell
   # whose cwd sits on a filesystem that was remounted (network mounts drop and come back)
   # holds a dead directory handle, getcwd fails with "Transport endpoint is not connected",
   # and anything launched from it dies on process.cwd. cd by absolute path re-resolves
   # through the live mount, healing such a shell; in a fresh window it is a no-op. If even
   # the cd fails the launch stops there and the shell stays for the error.
-  cmd=" cd -- ${(q)folder} && $inner && exit"
+  cmd=" cd -- ${(q)folder} && { $inner; tcrc=\$?; if [ \$tcrc -eq 0 ] || { [ \$tcrc -gt 128 ] && { [ \$tcrc -lt 145 ] || [ \$tcrc -gt 148 ]; }; }; then exit \$tcrc; fi; }"
 
   # already the requested session's window?
   win=""
@@ -530,7 +533,7 @@ HOOKSJSON
     fi
     if [ -z "$win" ]; then
       # never fall through with an empty target: tmux resolves it to the CURRENT window and
-      # the launch line (ending "&& exit") would be typed into whatever the user is doing
+      # the launch line (ending in the exit-status check) would be typed into whatever the user is doing
       printf "t-claude: could not create a window in session '%s'\n" "$session" >&2
       return 1
     fi
