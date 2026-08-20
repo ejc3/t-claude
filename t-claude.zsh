@@ -443,8 +443,12 @@ exit 0
 NOTIFY
   chmod +x "$notify" 2>/dev/null
   local hooksjson="$tcache/claude-hooks.json"
+  # The hook is the single notifier, so claude's own channel is off: under a control-mode
+  # client claude reads as never-focused and would ring its own bell beside every hook
+  # notification, while under a plain attach it reads as always-focused and stays silent
+  # -- neither belief is worth keeping when the hook fires on the event itself.
   cat > "$hooksjson" <<HOOKSJSON
-{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ssync","timeout":90}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$ssync","timeout":30}]}],"Notification":[{"hooks":[{"type":"command","command":"$notify","timeout":10}]}]}}
+{"preferredNotifChannel":"notifications_disabled","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ssync","timeout":90}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$ssync","timeout":30}]}],"Notification":[{"hooks":[{"type":"command","command":"$notify","timeout":10}]}]}}
 HOOKSJSON
   local hooks_flag=" --settings ${(q)hooksjson}"
   local pel
