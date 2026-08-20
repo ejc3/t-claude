@@ -415,9 +415,36 @@ fi
 exit 0
 SSYNC
   chmod +x "$ssync" 2>/dev/null
+  # Carry claude's "wants attention" events out to the enclosing terminal as a desktop
+  # notification: an OSC 777 wrapped for tmux passthrough, written to the pane's own tty so
+  # it rides the same path as any pane output. The hook fires on the Notification event
+  # itself, not on claude's channel decision -- that matters inside tmux, where claude
+  # cannot tell whether the outer terminal is showing this pane. The terminal can tell,
+  # and the window name rides along as the title so it can label what it shows.
+  local notify="$tcache/notify.sh"
+  cat > "$notify" <<'NOTIFY'
+#!/bin/sh
+# Emit claude's Notification hook event as OSC 777 through this pane's tty. Stdin is the
+# hook JSON; its message field becomes the body. Outside tmux, or without a tty, exit 0 --
+# a notifier must never block or fail a launch.
+[ -n "$TMUX" ] && [ -n "$TMUX_PANE" ] || exit 0
+tty="$(tmux display-message -p -t "$TMUX_PANE" '#{pane_tty}' 2>/dev/null)"
+[ -c "$tty" ] || exit 0
+title="$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null)"
+[ -n "$title" ] || title=claude
+body="$(sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+[ -n "$body" ] || body="needs attention"
+# A semicolon ends the title field of a 777, and control bytes would end the sequence.
+title=$(printf '%s' "$title" | tr -d '\000-\037\177;')
+body=$(printf '%s' "$body" | tr -d '\000-\037\177')
+[ -n "$TCLAUDE_NOTIFY_LOG" ] && printf 'notify %s\t%s\n' "$title" "$body" >> "$TCLAUDE_NOTIFY_LOG" 2>/dev/null
+printf '\033Ptmux;\033\033]777;notify;%s;%s\007\033\\' "$title" "$body" > "$tty" 2>/dev/null || :
+exit 0
+NOTIFY
+  chmod +x "$notify" 2>/dev/null
   local hooksjson="$tcache/claude-hooks.json"
   cat > "$hooksjson" <<HOOKSJSON
-{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ssync","timeout":90}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$ssync","timeout":30}]}]}}
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ssync","timeout":90}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$ssync","timeout":30}]}],"Notification":[{"hooks":[{"type":"command","command":"$notify","timeout":10}]}]}}
 HOOKSJSON
   local hooks_flag=" --settings ${(q)hooksjson}"
   local pel
