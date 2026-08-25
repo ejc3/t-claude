@@ -501,7 +501,7 @@ HOOKSJSON
   #
   # Under --auto: --continue when this project has transcripts (resumes the most recent
   # directly, no picker, continuity preserved), plain claude when it has none. claude keeps per-project
-  # transcripts in ~/.claude/projects/<abs path with '/' -> '-'>/*.jsonl; no transcript
+  # transcripts in ~/.claude/projects/<abs path, EVERY non-alphanumeric -> '-'>/*.jsonl; no transcript
   # means a bare --resume can only ever produce the empty picker. An explicit --resume
   # <id> or --session-id from the caller is always honoured -- this only governs the
   # implicit case.
@@ -511,7 +511,16 @@ HOOKSJSON
   # project nobody has opened here yet -- `claude --resume` can only show an empty picker,
   # so the first thing a new user meets is a dead end. Plain `claude` is what they want
   # there, and it is also what performs the initial Anthropic sign-in.
-  local projdir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${folder//\//-}"
+  # EVERY non-alphanumeric becomes '-', not just '/'. This has to match claude's own
+  # encoding exactly, and the rest of this file already gets it right -- see
+  # _tclaude_relabel and the title helper, both of which use `tr -c 'A-Za-z0-9' '-'`.
+  # This line did not, so a path containing an underscore or a dot looked in a directory
+  # that does not exist, found no transcripts, and fell through to plain `claude`: a NEW
+  # EMPTY conversation, with the real history unreachable and the picker never shown.
+  # /home/ubuntu/safe_cli searched -home-ubuntu-safe_cli while 34MB of history sat in
+  # -home-ubuntu-safe-cli. Dashes survive both encodings, which is why every other repo
+  # looked fine and this read as a one-repo mystery.
+  local projdir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${folder//[^A-Za-z0-9]/-}"
   local -a _hist; _hist=("$projdir"/*.jsonl(N))
 
   local inner
