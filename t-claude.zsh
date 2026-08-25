@@ -583,7 +583,13 @@ HOOKSJSON
   local created=0
   if [ -z "$win" ]; then
     if tmux has-session -t "=$session" 2>/dev/null; then
-      win="$(tmux new-window -d -P -F '#{window_id}' -t "=$session" -n "$winname" -c "$folder")"
+      # "=$session:" with the TRAILING COLON, not "=$session". A bare session name is a
+      # target-WINDOW spec, which tmux resolves to that session's current window -- so
+      # new-window asks for THAT index and dies with "create window failed: index 0 in use"
+      # the moment the session already has a window there. The trailing colon means "this
+      # session, next free index". move-window on the line above always had it; this call
+      # did not, so every attempt to add a second window to an existing session failed.
+      win="$(tmux new-window -d -P -F '#{window_id}' -t "=$session:" -n "$winname" -c "$folder")"
     else
       tmux new-session -d -s "$session" -n "$winname" -c "$folder"
       win="$(tmux list-windows -t "=$session" -F '#{window_id}' | head -1)"
