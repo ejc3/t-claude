@@ -381,6 +381,20 @@ sid=$(printf '%s' "$IN" | LC_ALL=C grep -aoE '"session_id":"[0-9a-fA-F-]{36}"' |
 src=$(printf '%s' "$IN" | LC_ALL=C grep -aoE '"source":"[a-z]*"' | head -1 | cut -d'"' -f4)
 cwd=$(printf '%s' "$IN" | LC_ALL=C grep -aoE '"cwd":"[^"]*"' | head -1 | sed 's/^"cwd":"//;s/"$//')
 
+# Stamp which machine runs this session: an `<id>.host` sidecar beside the transcript.
+# The transcript records no hostname, and guessing from content picks up hosts the
+# conversation merely TALKS about. Written only when the value changes, so a synced
+# store does not churn on every prompt.
+if [ -n "$sid" ] && [ -n "$cwd" ]; then
+  enc=$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9' '-')
+  hd="$HOME/.claude/projects/$enc"
+  hn=$(hostname -s 2>/dev/null)
+  if [ -n "$hn" ] && [ -d "$hd" ]; then
+    hf="$hd/$sid.host"
+    [ "$(cat "$hf" 2>/dev/null)" = "$hn" ] || printf '%s\n' "$hn" > "$hf" 2>/dev/null
+  fi
+fi
+
 # Follow only auto-managed conversations: a uuid-shaped resume id, or a not-yet-stamped (empty)
 # one. A human --resume label is left alone -- the title helper ignores those, and re-stamping
 # one would mislabel it.
