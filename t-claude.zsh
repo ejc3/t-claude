@@ -213,7 +213,7 @@ _tclaude_mint_view() {
   # close). And it must DETACH the client rather than kill the view: killing a grouped
   # session out from under its live client detaches the group's OTHER clients too
   # (measured on 3.7b -- one /exit closed every tab). Detaching is ripple-free, and the
-  # client-detached hook below then reaps the view once it is clientless.
+  # destroy-unattached below then reaps the view once it is clientless.
   tmux set-hook -t "$view" window-unlinked \
     "run-shell -b \"tmux list-windows -a -F '##{window_id}' | grep -qx '$win' || tmux detach-client -s '$view' 2>/dev/null || true\"" 2>/dev/null
   # A grouped session shares windows but has its OWN session options, so the status-off
@@ -225,7 +225,16 @@ _tclaude_mint_view() {
   # named after the claude session it is showing.
   tmux set-option -t "$view" set-titles on 2>/dev/null
   tmux set-option -t "$view" set-titles-string "#{window_name}" 2>/dev/null
-  tmux set-hook -t "$view" client-detached "kill-session -t $view" 2>/dev/null
+  # Reap the view when its LAST client leaves. destroy-unattached is the primitive for
+  # that and a hook is not: client-detached fires on EVERY detach, so the older
+  # `client-detached -> kill-session` killed the view out from under any OTHER client
+  # still on it -- two terminals on one view, one closes, both die. Grouped sessions make
+  # that worse, since killing one out from under a live client ripples to the group.
+  # destroy-unattached cannot: it fires only once the session is already clientless.
+  # ARMED FROM client-attached, not set here: a freshly minted view is clientless for the
+  # moment between new-session and attach, and setting the option then destroys the view
+  # before its client can arrive (measured -- the attach finds no session).
+  tmux set-hook -t "$view" client-attached "set-option -t $view destroy-unattached on" 2>/dev/null
   printf '%s\n' "$view"
 }
 
@@ -261,6 +270,22 @@ t-claude() {
   # effect without every shell re-sourcing.
   local hv hh hw
   for hv in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '__tcv__' 2>/dev/null); do
+    # Retire the old client-detached reaper wherever it is still live. It fires on every
+    # detach and kills the whole view, so a second terminal opening and closing on a view
+    # takes the first one's session with it.
+    if tmux show-hooks -t "$hv" 2>/dev/null | grep -q "client-detached.*kill-session"; then
+      tmux set-hook -u -t "$hv" client-detached 2>/dev/null
+      tmux set-hook -t "$hv" client-attached "set-option -t $hv destroy-unattached on" 2>/dev/null
+      # Arm the option now only for a view that DEMONSTRABLY has a client -- one attached
+      # before this heal existed never ran its client-attached hook. The test must fail SAFE:
+      # destroy-unattached on a CLIENTLESS session destroys it on the spot (measured), so
+      # anything but a positive client count leaves the option alone and the start-of-run reap
+      # collects the view instead. Target is the BARE name, no "=": an "=" prefix here returns
+      # EMPTY rather than erroring (measured, same trap as set-option below), and empty read as
+      # "not zero" by a negated test is exactly how this line first destroyed live views.
+      [ "$(tmux list-clients -t "$hv" -F x 2>/dev/null | wc -l)" -gt 0 ] 2>/dev/null &&
+        tmux set-option -t "$hv" destroy-unattached on 2>/dev/null
+    fi
     hh="$(tmux show-hooks -t "$hv" 2>/dev/null | grep -m1 window-unlinked)"
     [ -n "$hh" ] || continue
     hw="${${hh#*grep -qx \'}%%\'*}"
@@ -713,6 +738,20 @@ HOOKSJSON
   # and `-ga` APPENDS, so guard against unbounded duplicate growth over a weeks-long server. No "="
   # prefix on set-option's target: tested, it fails "no such session: =foo"; bare "$session" hits the
   # exact match when one exists.
+  #
+  # WINDOW SIZE is deliberately NOT set here -- tmux's default (`window-size latest`) is the
+  # policy we want. Native scrollback needs the client's size to EQUAL the window's: when it
+  # does, tmux scrolls with plain linefeeds and the terminal keeps the lines that roll off the
+  # top. When it does not, tmux sets a DECSTBM scrolling region and repaints inside it -- and a
+  # terminal DISCARDS lines scrolled out of a region, so scrollback silently stops working
+  # (measured: a 51x26 client on a 51x29 window emits ESC[1;26r and 2.4x the bytes for the same
+  # output, with repeated full-screen repaints). A window has ONE grid, so when several clients
+  # sit on it only one size can win. `latest` hands the win to the most recently used client,
+  # which is what we want: the terminal you just connected renders correctly, and stale viewers
+  # parked on the same window go janky instead. No other value helps -- `largest` breaks the
+  # small clients, `smallest` leaves the big client bigger than the window (tmux then flips
+  # ESC[1;26r/ESC[1;29r around every scroll), `manual` breaks everyone who does not match. The
+  # constraint is structural (one grid, N sizes), so the only real lever is N.
   tmux set-option -t "$session" status off 2>/dev/null
   tmux set-option -t "$session" set-titles on 2>/dev/null
   tmux set-option -t "$session" set-titles-string "#{window_name}" 2>/dev/null
