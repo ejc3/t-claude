@@ -836,6 +836,18 @@ TSYNC
   overrides="$(tmux show-options -gv terminal-overrides 2>/dev/null)"
   case "$overrides" in *'smcup@:rmcup@'*) ;; *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;; esac
   case "$overrides" in *'indn@'*) ;; *) tmux set-option -ga terminal-overrides ',*:indn@' 2>/dev/null ;; esac
+  # Sync mode on the OUTPUT side only. nosync-wrap strips claude's CSI ?2026h/l on the way IN,
+  # so tmux cannot buffer a whole repaint into one viewport update and swallow the scrolled
+  # lines -- that is what keeps scrollback working, and the documented cost is that claude's
+  # repaints stop being atomic, so a fast-updating status area tears. Telling tmux the CLIENT
+  # terminal speaks sync lets tmux re-wrap its OWN frames instead: measured on an isolated
+  # server, the same 60-line scroll still emits 101 plain linefeeds and ZERO DECSTBM (scrollback
+  # intact) while gaining 34 sync wrappers, so a half-drawn frame is never displayed. Worth the
+  # ~18% extra bytes because tearing that reaches the screen is PERMANENT once it scrolls into
+  # scrollback -- scrollback cannot be repainted.
+  local tfeat
+  tfeat="$(tmux show-options -sv terminal-features 2>/dev/null)"
+  case "$tfeat" in *sync*) ;; *) tmux set-option -sa terminal-features ',xterm-256color:sync' 2>/dev/null ;; esac
 
   # ATTACH. Inside tmux already: just move this one client to the window. From a bare terminal
   # (a new cmux tab): attach a per-invocation GROUPED VIEW parked on this window -- it shares the
