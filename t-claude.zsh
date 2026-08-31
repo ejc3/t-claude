@@ -564,9 +564,43 @@ HOOKSJSON
   # the cd fails the launch stops there and the shell stays for the error.
   cmd=" cd -- ${(q)folder} && { $inner; tcrc=\$?; if [ \$tcrc -eq 0 ] || { [ \$tcrc -gt 128 ] && { [ \$tcrc -lt 145 ] || [ \$tcrc -gt 148 ]; }; }; then exit \$tcrc; fi; }"
 
+  # Called from a real tmux pane you are sitting in: that pane is where you asked for claude,
+  # so make THIS window the session's window instead of minting another one and pulling the
+  # client over to it. Without this, running t-claude from a shell tab always left that tab
+  # behind at its prompt and opened a second one -- the same complaint whether the folder had
+  # a window already (the client jumped to it) or not (a new window appeared).
+  #
+  # Deliberately ahead of the reuse/move/create search: adopting only when the folder had no
+  # window would still jump for the case that prompted this, a session already open elsewhere.
+  # Duplicate keys are the price and they are the honest description of what happens: two
+  # windows now hold the same conversation, which is what "resuming it here too" means.
+  #
+  # Bounded by three conditions. No tty means a hook or a script is driving and there is no
+  # "here" to adopt. Outside tmux there is no current window at all. And the current window's
+  # HOME session must be the session this launch resolved to, so `--tmux other-group` from an
+  # unrelated tab still routes to that group rather than dragging this window into it.
+  local adopted=0 here="" here_home=""
+  if [ -n "${TMUX-}" ] && [ -t 0 ] && [ "${TCLAUDE_ADOPT_PANE:-1}" = 1 ]; then
+    here="$(tmux display-message -p '#{window_id}' 2>/dev/null)"
+    if [ -n "$here" ]; then
+      # The client may be attached to a linked view (cmux's mirror, or t-claude's own
+      # __tcv__), where `#{session_name}` names the view rather than the window's home.
+      # Ask which real session owns the window instead.
+      here_home="$(tmux list-windows -a -F '#{session_name} #{window_id}' 2>/dev/null \
+        | awk -v w="$here" '$2==w && $1 !~ /^cmux-view-/ && $1 !~ /__tcv__/ {print $1; exit}')"
+    fi
+    if [ -n "$here_home" ] && [ "$here_home" = "$session" ]; then
+      win="$here"
+      adopted=1
+      tmux set-option -w -t "$win" @tclaude_key "$key" 2>/dev/null
+      [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
+      tmux send-keys -t "$win" "$cmd" Enter
+    fi
+  fi
+
   # already the requested session's window?
-  win=""
-  if tmux has-session -t "=$session" 2>/dev/null; then
+  if [ "$adopted" = 0 ]; then win=""; fi
+  if [ "$adopted" = 0 ] && tmux has-session -t "=$session" 2>/dev/null; then
     win="$(tmux list-windows -t "=$session" -F '#{window_id} #{@tclaude_key}' 2>/dev/null | awk -v k="$key" '$2==k {print $1; exit}')"
   fi
 
@@ -593,8 +627,11 @@ HOOKSJSON
     fi
   fi
 
-  # nothing to reuse/move: add a new window (creating the session if needed)
-  local created=0
+  # nothing to reuse/move: add a new window (creating the session if needed).
+  # An adopted pane counts as created: its launch line is already sent, and the
+  # reuse path below would otherwise find no claude running yet (this shell has not
+  # returned to its prompt) and send a second one.
+  local created=$adopted
   if [ -z "$win" ]; then
     if tmux has-session -t "=$session" 2>/dev/null; then
       # "=$session:" with the TRAILING COLON, not "=$session". A bare session name is a
@@ -773,6 +810,9 @@ TSYNC
     printf 'window %s ready in session %s (not attaching: no terminal)\n' "$winname" "$session" >&2
     return 0
   fi
+  # An adopted pane is already the window the caller is looking at, so there is nothing to
+  # select and no client to move. Switching here would be the very jump this path removes.
+  if [ "$adopted" = 1 ]; then return 0; fi
   local widx
   widx="$(tmux list-windows -t "=$session" -F $'#{window_id}\t#{window_index}' 2>/dev/null | awk -F'\t' -v w="$win" '$1==w{print $2; exit}')"
   if [ -n "${TMUX-}" ]; then
