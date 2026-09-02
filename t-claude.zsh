@@ -164,6 +164,23 @@ _tclaude_file_title() {
 # label (fb4a stays fb4a), but brought back as the tiebreaker if that skip would leave two
 # windows identically named. uuid-shaped ids never label. All values are sanitized with the
 # same class the creation path uses, so the two naming sites agree.
+# A window label as the user wrote it. Windows are addressed by @id everywhere in this file,
+# so a title may hold spaces, brackets and punctuation without breaking a tmux target; only
+# control characters and whitespace runs are tidied, and one matching pair of surrounding
+# quotes comes off (claude stores a /rename argument verbatim, quotes included). Squeezing
+# everything else into "_" is what turned "[NR] Errors" into __NR__Errors_ on a tab.
+_tclaude_label_clean() {
+  local t="$1"
+  t="$(printf '%s' "$t" | LC_ALL=C tr -s '[:cntrl:][:space:]' ' ')"
+  t="${t## }"; t="${t%% }"
+  if [ ${#t} -ge 2 ]; then
+    case "$t" in
+      \"*\"|\'*\') t="${t[2,-2]}"; t="${t## }"; t="${t%% }" ;;
+    esac
+  fi
+  printf '%s' "$t"
+}
+
 _tclaude_relabel() {
   emulate -L zsh
   local sess="$1"
@@ -176,7 +193,7 @@ _tclaude_relabel() {
     [ -n "${parts[2]-}" ] || continue
     ids+=("$parts[1]"); paths+=("$parts[2]")
     resumes+=("$(printf '%s' "${parts[3]-}" | tr -c 'A-Za-z0-9._-' '_')")
-    local wt="$(printf '%s' "${parts[4]-}" | tr -c 'A-Za-z0-9._-' '_')"
+    local wt="$(_tclaude_label_clean "${parts[4]-}")"
     # a /rename inside claude lands in the session file; pick it up so the tab follows.
     # The file path is derivable from what we stamp: claude keys its projects dir by the
     # folder with non-alphanumerics turned into "-".
@@ -184,7 +201,7 @@ _tclaude_relabel() {
       local sfile="$HOME/.claude/projects/$(printf '%s' "$parts[2]" | tr -c 'A-Za-z0-9' '-')/${parts[3]}.jsonl"
       local ft="$(_tclaude_file_title "$sfile")"
       if [ -n "$ft" ]; then
-        ft="$(printf '%s' "$ft" | tr -c 'A-Za-z0-9._-' '_')"
+        ft="$(_tclaude_label_clean "$ft")"
         if [ "$ft" != "$wt" ]; then
           wt="$ft"
           tmux set-option -w -t "$parts[1]" @tclaude_title "$ft" 2>/dev/null
