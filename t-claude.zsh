@@ -153,7 +153,7 @@ _tclaude_file_title() {
   local line t
   line="$(tail -c 4194304 "$1" 2>/dev/null | LC_ALL=C grep -aF '"type":"custom-title"' | tail -1)"
   [ -n "$line" ] || return 0
-  t="$(printf '%s' "$line" | grep -aoE '"customTitle":"(\\\\.|[^"\\\\])*"' | head -1)"
+  t="$(printf '%s' "$line" | grep -aoE '"customTitle":"(\\.|[^"\\])*"' | head -1)"
   t="${t#*:\"}"; t="${t%\"}"
   printf '%s' "$t" | sed -e 's/\\\(.\)/\1/g'
 }
