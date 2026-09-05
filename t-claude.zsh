@@ -14,6 +14,12 @@
 #                          client/server mode (NOT `tmux -CC` control mode -- no iOS
 #                          client speaks it). Sessions/windows are managed here.
 #   - claude               Claude Code on PATH.
+#   - tmux (patched)       OPTIONAL: a tmux from github.com/ejc3/tmux branch scroll-native
+#                          adds scroll-passthrough and scroll-replay, which keep the OUTER
+#                          terminal's own scrollback correct (swipe-to-scroll on a phone).
+#                          Install it as tmux-scroll in ~/.local/bin or /usr/local/bin, or
+#                          point $TCLAUDE_TMUX at it; t-claude puts it first on PATH. Absent
+#                          -> a stock tmux works, minus native scrollback across big scrolls.
 #   - nosync-wrap          /usr/local/bin/nosync-wrap -- a pty shim that strips Claude's
 #                          synchronized-output sequences (CSI ?2026h/l) so tmux does not
 #                          swallow scrollback. OPTIONAL: if absent, launches bare claude
@@ -74,6 +80,39 @@
 # True when $1 is uuid-shaped: 36 chars, hex plus exactly four dashes. Used to keep machine
 # ids out of window titles -- a uuid disambiguates the window KEY, but as a label it's noise
 # ("myrepo" beats "myrepo-2f3a4b5c-..."). Short human ids ("my-diffs") still show.
+# Put the best available tmux first on PATH, so every `tmux` below -- and every
+# `tmux` the hook scripts and run-shell children invoke -- is the same binary that
+# starts the server. This matters twice over: the scroll-passthrough/scroll-replay
+# options only exist in a patched build (github.com/ejc3/tmux, branch scroll-native),
+# and a tmux client refuses to talk to a server of a different PROTOCOL version, so a
+# patched next-3.8 server and a stock 3.7b client on the same box cannot be mixed --
+# one binary has to win for the whole session.
+#
+# Candidates, first that exists and advertises `scroll-replay` (grep the file, no
+# server spawned) wins: $TCLAUDE_TMUX, then a distinctly-named build a package manager
+# restoring /usr/local/bin/tmux will not clobber, then a plain tmux in the usual
+# prefixes. Found -> symlink it into a t-claude-owned bin dir and prepend that
+# (idempotent). None found -> leave PATH alone; the options below are set with
+# 2>/dev/null and a stock tmux ignores them, so the feature just degrades.
+_tclaude_use_patched_tmux() {
+  local shimdir="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/bin"
+  case ":$PATH:" in *":$shimdir:"*)
+    # Already shimmed this shell; keep it unless the symlink target has gone.
+    [ -x "$shimdir/tmux" ] && return 0 ;;
+  esac
+  local cand
+  for cand in "$TCLAUDE_TMUX" \
+              "$HOME/.local/bin/tmux-scroll" /usr/local/bin/tmux-scroll \
+              "$HOME/.local/bin/tmux" /usr/local/bin/tmux; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    grep -qa 'scroll-replay' "$cand" 2>/dev/null || continue
+    mkdir -p "$shimdir" 2>/dev/null || return 0
+    ln -sf "$cand" "$shimdir/tmux" 2>/dev/null || return 0
+    case ":$PATH:" in *":$shimdir:"*) ;; *) export PATH="$shimdir:$PATH" ;; esac
+    return 0
+  done
+}
+
 _tclaude_is_uuid() {
   [ "${#1}" -eq 36 ] || return 1
   [ -z "$(printf '%s' "$1" | tr -d '0-9a-fA-F-')" ] || return 1
@@ -213,7 +252,7 @@ _tclaude_mint_view() {
   # close). And it must DETACH the client rather than kill the view: killing a grouped
   # session out from under its live client detaches the group's OTHER clients too
   # (measured on 3.7b -- one /exit closed every tab). Detaching is ripple-free, and the
-  # client-detached hook below then reaps the view once it is clientless.
+  # destroy-unattached below then reaps the view once it is clientless.
   tmux set-hook -t "$view" window-unlinked \
     "run-shell -b \"tmux list-windows -a -F '##{window_id}' | grep -qx '$win' || tmux detach-client -s '$view' 2>/dev/null || true\"" 2>/dev/null
   # A grouped session shares windows but has its OWN session options, so the status-off
@@ -225,7 +264,16 @@ _tclaude_mint_view() {
   # named after the claude session it is showing.
   tmux set-option -t "$view" set-titles on 2>/dev/null
   tmux set-option -t "$view" set-titles-string "#{window_name}" 2>/dev/null
-  tmux set-hook -t "$view" client-detached "kill-session -t $view" 2>/dev/null
+  # Reap the view when its LAST client leaves. destroy-unattached is the primitive for
+  # that and a hook is not: client-detached fires on EVERY detach, so the older
+  # `client-detached -> kill-session` killed the view out from under any OTHER client
+  # still on it -- two terminals on one view, one closes, both die. Grouped sessions make
+  # that worse, since killing one out from under a live client ripples to the group.
+  # destroy-unattached cannot: it fires only once the session is already clientless.
+  # ARMED FROM client-attached, not set here: a freshly minted view is clientless for the
+  # moment between new-session and attach, and setting the option then destroys the view
+  # before its client can arrive (measured -- the attach finds no session).
+  tmux set-hook -t "$view" client-attached "set-option -t $view destroy-unattached on" 2>/dev/null
   printf '%s\n' "$view"
 }
 
@@ -244,6 +292,9 @@ t-claude() {
       return 1
     fi
   fi
+  # Prefer a patched tmux (scroll-passthrough/scroll-replay) if one is installed.
+  _tclaude_use_patched_tmux
+
   local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
@@ -261,6 +312,22 @@ t-claude() {
   # effect without every shell re-sourcing.
   local hv hh hw
   for hv in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '__tcv__' 2>/dev/null); do
+    # Retire the old client-detached reaper wherever it is still live. It fires on every
+    # detach and kills the whole view, so a second terminal opening and closing on a view
+    # takes the first one's session with it.
+    if tmux show-hooks -t "$hv" 2>/dev/null | grep -q "client-detached.*kill-session"; then
+      tmux set-hook -u -t "$hv" client-detached 2>/dev/null
+      tmux set-hook -t "$hv" client-attached "set-option -t $hv destroy-unattached on" 2>/dev/null
+      # Arm the option now only for a view that DEMONSTRABLY has a client -- one attached
+      # before this heal existed never ran its client-attached hook. The test must fail SAFE:
+      # destroy-unattached on a CLIENTLESS session destroys it on the spot (measured), so
+      # anything but a positive client count leaves the option alone and the start-of-run reap
+      # collects the view instead. Target is the BARE name, no "=": an "=" prefix here returns
+      # EMPTY rather than erroring (measured, same trap as set-option below), and empty read as
+      # "not zero" by a negated test is exactly how this line first destroyed live views.
+      [ "$(tmux list-clients -t "$hv" -F x 2>/dev/null | wc -l)" -gt 0 ] 2>/dev/null &&
+        tmux set-option -t "$hv" destroy-unattached on 2>/dev/null
+    fi
     hh="$(tmux show-hooks -t "$hv" 2>/dev/null | grep -m1 window-unlinked)"
     [ -n "$hh" ] || continue
     hw="${${hh#*grep -qx \'}%%\'*}"
@@ -693,6 +760,23 @@ HOOKSJSON
   # older t-claude get labelled too. Then retitle the whole session (basename, extended on collision).
   tmux set-option -w -t "$win" @tclaude_path "$folder" 2>/dev/null
   tmux set-option -w -t "$win" @tclaude_resume "$tcid" 2>/dev/null
+  # NATIVE SCROLLBACK, the two halves that need a tmux carrying the scroll-native
+  # patch (github.com/ejc3/tmux, branch scroll-native); both are silently ignored
+  # by a stock tmux, which is why they are set with the same 2>/dev/null as the
+  # rest and why nothing here depends on them.
+  #
+  # scroll-passthrough: tmux's write collector drops the pending write for a row
+  # as it scrolls out and clamps a batch of scrolls to the height of the region.
+  # Invisible in the pane, whose grid keeps the lines, but the terminal only ever
+  # keeps what tmux sends it -- measured at 2044 lines lost out of ~4000, with 52
+  # rows of claude's own footer pushed into the scrollback in their place.
+  #
+  # scroll-replay: tmux keeps history per pane, the terminal keeps ONE buffer for
+  # the whole connection. Without this, switching windows leaves the previous
+  # project's output in it and scrolling back crosses between projects. 2000 lines
+  # is roughly a phone screen's worth of useful depth at ~11 bytes a line.
+  tmux set-option -w -t "$win" scroll-passthrough on 2>/dev/null
+  tmux set-option -w -t "$win" scroll-replay 2000 2>/dev/null
   # @tclaude_managed marks a window that TRACKS an auto-minted uuid conversation (c-claude, or
   # --resume/--session-id <uuid>). session-sync only re-keys and runs the branch-hook for these;
   # a folder-only or human-label window stays unmanaged so its folder-based reuse key is left
@@ -713,6 +797,20 @@ HOOKSJSON
   # and `-ga` APPENDS, so guard against unbounded duplicate growth over a weeks-long server. No "="
   # prefix on set-option's target: tested, it fails "no such session: =foo"; bare "$session" hits the
   # exact match when one exists.
+  #
+  # WINDOW SIZE is deliberately NOT set here -- tmux's default (`window-size latest`) is the
+  # policy we want. Native scrollback needs the client's size to EQUAL the window's: when it
+  # does, tmux scrolls with plain linefeeds and the terminal keeps the lines that roll off the
+  # top. When it does not, tmux sets a DECSTBM scrolling region and repaints inside it -- and a
+  # terminal DISCARDS lines scrolled out of a region, so scrollback silently stops working
+  # (measured: a 51x26 client on a 51x29 window emits ESC[1;26r and 2.4x the bytes for the same
+  # output, with repeated full-screen repaints). A window has ONE grid, so when several clients
+  # sit on it only one size can win. `latest` hands the win to the most recently used client,
+  # which is what we want: the terminal you just connected renders correctly, and stale viewers
+  # parked on the same window go janky instead. No other value helps -- `largest` breaks the
+  # small clients, `smallest` leaves the big client bigger than the window (tmux then flips
+  # ESC[1;26r/ESC[1;29r around every scroll), `manual` breaks everyone who does not match. The
+  # constraint is structural (one grid, N sizes), so the only real lever is N.
   tmux set-option -t "$session" status off 2>/dev/null
   tmux set-option -t "$session" set-titles on 2>/dev/null
   tmux set-option -t "$session" set-titles-string "#{window_name}" 2>/dev/null
@@ -797,6 +895,18 @@ TSYNC
   overrides="$(tmux show-options -gv terminal-overrides 2>/dev/null)"
   case "$overrides" in *'smcup@:rmcup@'*) ;; *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;; esac
   case "$overrides" in *'indn@'*) ;; *) tmux set-option -ga terminal-overrides ',*:indn@' 2>/dev/null ;; esac
+  # Sync mode on the OUTPUT side only. nosync-wrap strips claude's CSI ?2026h/l on the way IN,
+  # so tmux cannot buffer a whole repaint into one viewport update and swallow the scrolled
+  # lines -- that is what keeps scrollback working, and the documented cost is that claude's
+  # repaints stop being atomic, so a fast-updating status area tears. Telling tmux the CLIENT
+  # terminal speaks sync lets tmux re-wrap its OWN frames instead: measured on an isolated
+  # server, the same 60-line scroll still emits 101 plain linefeeds and ZERO DECSTBM (scrollback
+  # intact) while gaining 34 sync wrappers, so a half-drawn frame is never displayed. Worth the
+  # ~18% extra bytes because tearing that reaches the screen is PERMANENT once it scrolls into
+  # scrollback -- scrollback cannot be repainted.
+  local tfeat
+  tfeat="$(tmux show-options -sv terminal-features 2>/dev/null)"
+  case "$tfeat" in *sync*) ;; *) tmux set-option -sa terminal-features ',xterm-256color:sync' 2>/dev/null ;; esac
 
   # ATTACH. Inside tmux already: just move this one client to the window. From a bare terminal
   # (a new cmux tab): attach a per-invocation GROUPED VIEW parked on this window -- it shares the
