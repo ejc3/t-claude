@@ -718,6 +718,23 @@ HOOKSJSON
   # older t-claude get labelled too. Then retitle the whole session (basename, extended on collision).
   tmux set-option -w -t "$win" @tclaude_path "$folder" 2>/dev/null
   tmux set-option -w -t "$win" @tclaude_resume "$tcid" 2>/dev/null
+  # NATIVE SCROLLBACK, the two halves that need a tmux carrying the scroll-native
+  # patch (github.com/ejc3/tmux, branch scroll-native); both are silently ignored
+  # by a stock tmux, which is why they are set with the same 2>/dev/null as the
+  # rest and why nothing here depends on them.
+  #
+  # scroll-passthrough: tmux's write collector drops the pending write for a row
+  # as it scrolls out and clamps a batch of scrolls to the height of the region.
+  # Invisible in the pane, whose grid keeps the lines, but the terminal only ever
+  # keeps what tmux sends it -- measured at 2044 lines lost out of ~4000, with 52
+  # rows of claude's own footer pushed into the scrollback in their place.
+  #
+  # scroll-replay: tmux keeps history per pane, the terminal keeps ONE buffer for
+  # the whole connection. Without this, switching windows leaves the previous
+  # project's output in it and scrolling back crosses between projects. 2000 lines
+  # is roughly a phone screen's worth of useful depth at ~11 bytes a line.
+  tmux set-option -w -t "$win" scroll-passthrough on 2>/dev/null
+  tmux set-option -w -t "$win" scroll-replay 2000 2>/dev/null
   # @tclaude_managed marks a window that TRACKS an auto-minted uuid conversation (c-claude, or
   # --resume/--session-id <uuid>). session-sync only re-keys and runs the branch-hook for these;
   # a folder-only or human-label window stays unmanaged so its folder-based reuse key is left
