@@ -14,6 +14,12 @@
 #                          client/server mode (NOT `tmux -CC` control mode -- no iOS
 #                          client speaks it). Sessions/windows are managed here.
 #   - claude               Claude Code on PATH.
+#   - tmux (patched)       OPTIONAL: a tmux from github.com/ejc3/tmux branch scroll-native
+#                          adds scroll-passthrough and scroll-replay, which keep the OUTER
+#                          terminal's own scrollback correct (swipe-to-scroll on a phone).
+#                          Install it as tmux-scroll in ~/.local/bin or /usr/local/bin, or
+#                          point $TCLAUDE_TMUX at it; t-claude puts it first on PATH. Absent
+#                          -> a stock tmux works, minus native scrollback across big scrolls.
 #   - nosync-wrap          /usr/local/bin/nosync-wrap -- a pty shim that strips Claude's
 #                          synchronized-output sequences (CSI ?2026h/l) so tmux does not
 #                          swallow scrollback. OPTIONAL: if absent, launches bare claude
@@ -74,6 +80,39 @@
 # True when $1 is uuid-shaped: 36 chars, hex plus exactly four dashes. Used to keep machine
 # ids out of window titles -- a uuid disambiguates the window KEY, but as a label it's noise
 # ("myrepo" beats "myrepo-2f3a4b5c-..."). Short human ids ("my-diffs") still show.
+# Put the best available tmux first on PATH, so every `tmux` below -- and every
+# `tmux` the hook scripts and run-shell children invoke -- is the same binary that
+# starts the server. This matters twice over: the scroll-passthrough/scroll-replay
+# options only exist in a patched build (github.com/ejc3/tmux, branch scroll-native),
+# and a tmux client refuses to talk to a server of a different PROTOCOL version, so a
+# patched next-3.8 server and a stock 3.7b client on the same box cannot be mixed --
+# one binary has to win for the whole session.
+#
+# Candidates, first that exists and advertises `scroll-replay` (grep the file, no
+# server spawned) wins: $TCLAUDE_TMUX, then a distinctly-named build a package manager
+# restoring /usr/local/bin/tmux will not clobber, then a plain tmux in the usual
+# prefixes. Found -> symlink it into a t-claude-owned bin dir and prepend that
+# (idempotent). None found -> leave PATH alone; the options below are set with
+# 2>/dev/null and a stock tmux ignores them, so the feature just degrades.
+_tclaude_use_patched_tmux() {
+  local shimdir="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/bin"
+  case ":$PATH:" in *":$shimdir:"*)
+    # Already shimmed this shell; keep it unless the symlink target has gone.
+    [ -x "$shimdir/tmux" ] && return 0 ;;
+  esac
+  local cand
+  for cand in "$TCLAUDE_TMUX" \
+              "$HOME/.local/bin/tmux-scroll" /usr/local/bin/tmux-scroll \
+              "$HOME/.local/bin/tmux" /usr/local/bin/tmux; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    grep -qa 'scroll-replay' "$cand" 2>/dev/null || continue
+    mkdir -p "$shimdir" 2>/dev/null || return 0
+    ln -sf "$cand" "$shimdir/tmux" 2>/dev/null || return 0
+    case ":$PATH:" in *":$shimdir:"*) ;; *) export PATH="$shimdir:$PATH" ;; esac
+    return 0
+  done
+}
+
 _tclaude_is_uuid() {
   [ "${#1}" -eq 36 ] || return 1
   [ -z "$(printf '%s' "$1" | tr -d '0-9a-fA-F-')" ] || return 1
@@ -253,6 +292,9 @@ t-claude() {
       return 1
     fi
   fi
+  # Prefer a patched tmux (scroll-passthrough/scroll-replay) if one is installed.
+  _tclaude_use_patched_tmux
+
   local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
