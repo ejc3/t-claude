@@ -889,6 +889,27 @@ tmux rename-window -t "$wid" "$name" 2>/dev/null
 exit 0
 TSYNC
   chmod +x "$tsync" 2>/dev/null
+
+  # resize-settle: a phone terminal reports a new size before its viewport has finished changing
+  # (Prompt, measured: a keyboard toggle is one to six size reports over up to four seconds), so
+  # the full repaint tmux sends for each report lands on a geometry the terminal has already left,
+  # leaving the bottom rows stale. Repaint once
+  # more after the LAST resize of a burst: every event writes a token and sleeps; only the latest
+  # one repaints, at 0.6 s and again at 1.6 s. A helper FILE for the same reason as title-sync.sh.
+  local rsettle="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/resize-settle"
+  cat > "$rsettle" <<'RSETTLE'
+#!/bin/sh
+# args: socket_path client_name  (written by t-claude; regenerated every launch)
+sock="$1"; c="$2"; [ -n "$c" ] || exit 0
+f="$(dirname "$0")/settle.$(printf '%s' "$c" | tr -c 'A-Za-z0-9' _)"
+tok="$$.$(date +%s%N)"; printf '%s' "$tok" > "$f"
+for delay in 0.6 1.0; do
+  sleep "$delay"
+  [ "$(cat "$f" 2>/dev/null)" = "$tok" ] || exit 0
+  tmux -S "$sock" refresh-client -t "$c" 2>/dev/null
+done
+RSETTLE
+  chmod +x "$rsettle" 2>/dev/null
   # GLOBAL, not per-session (measured on a live server): when a window is displayed
   # through a grouped view -- which is how every t-claude client attaches -- tmux runs
   # pane-title-changed in the VIEW session's context, so a hook on the home session
@@ -916,6 +937,7 @@ TSYNC
   # one in their own context, which is fine -- view churn is not topology.
   tmux set-hook -g window-linked "run-shell -b \"[ -x ${(q)khooks}/topology-snap ] && ${(q)khooks}/topology-snap #{q:socket_path} || true\"" 2>/dev/null
   tmux set-hook -g window-unlinked "run-shell -b \"[ -x ${(q)khooks}/topology-snap ] && ${(q)khooks}/topology-snap #{q:socket_path} || true\"" 2>/dev/null
+  tmux set-hook -g client-resized "run-shell -b \"[ -x ${(q)khooks}/resize-settle ] && ${(q)khooks}/resize-settle #{q:socket_path} #{q:client_name} || true\"" 2>/dev/null
   tmux bind-key M choose-tree -Zs "run-shell -b \"if [ -x ${(q)khooks}/key-move ]; then ${(q)khooks}/key-move '#{socket_path}' '#{pane_id}' '%%'; else tmux move-window -s '#{window_id}' -t '%%:'; fi\"" 2>/dev/null
   tmux bind-key B run-shell -b "[ -x ${(q)khooks}/key-branch ] && ${(q)khooks}/key-branch #{q:socket_path} #{q:pane_id} || true" 2>/dev/null
   _tclaude_native_screen
