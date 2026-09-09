@@ -126,12 +126,16 @@ _tclaude_native_screen() {
     tmux show-options -g terminal-overrides 2>/dev/null | while IFS= read -r line; do
       case "$line" in *'smcup@:rmcup@'*) tmux set-option -gu "${line%% *}" 2>/dev/null ;; esac
     done
-  else
-    case "$(tmux show-options -gv terminal-overrides 2>/dev/null)" in
-      *'smcup@:rmcup@'*) ;;
-      *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;;
-    esac
   fi
+  # Confirm one of the two mechanisms actually took. Neither means the terminal enters the
+  # alternate screen and there is no scrollback at all -- the silent breakage this file exists
+  # to avoid -- so fall back to deleting the capability. Reached when the server was not up
+  # when this ran, or when clear-on-attach could not be set.
+  [ "$(tmux show-options -sv clear-on-attach 2>/dev/null)" = off ] && return 0
+  case "$(tmux show-options -gv terminal-overrides 2>/dev/null)" in
+    *'smcup@:rmcup@'*) ;;
+    *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;;
+  esac
 }
 
 _tclaude_use_patched_tmux() {
