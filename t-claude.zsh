@@ -487,7 +487,7 @@ t-claude() {
   # `nosync-wrap claude ...`, so the shell runs nosync-wrap and the function is skipped -- a flag
   # can't be exported, so it belongs in this command.
   local wrap=""; command -v nosync-wrap >/dev/null 2>&1 && wrap="nosync-wrap "
-  local flags="--dangerously-skip-permissions --effort ultracode"
+  local flags="--dangerously-skip-permissions --effort high"
 
   # SESSION-FOLLOW HOOKS. Claude can switch the id a window is showing mid-run: /branch and
   # /clear each mint a NEW session id, and /cd moves the conversation to another folder. Left
