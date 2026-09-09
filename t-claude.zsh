@@ -70,6 +70,19 @@
 #                   reopening one. A wrapper can hand out a deterministic id on the first run
 #                   and `--resume` the same id ever after; both runs land in the same window.
 #                   uuid-shaped ids are kept out of window titles (they key, they don't label).
+#   --agent-cmd <cmd> : run THIS shell command in the window instead of the claude line
+#                   t-claude would build (no hooks, no default flags -- the caller owns the
+#                   whole command, quoting included). --resume/--session-id still key and
+#                   stamp the window, they just do not reach the command. A wrapper uses this
+#                   to run some other agent under the same window discipline.
+#   --agent-label <name> : what the window's process is called (default claude); stamped as
+#                   @tclaude_agent and used by the liveness check -- a pane counts as busy when
+#                   a child of its shell is named <name>, starts with <name> (a launcher and
+#                   its <name>.real), or is `nosync-wrap <name>`. TCLAUDE_AGENT_CMD and
+#                   TCLAUDE_AGENT_LABEL in the environment are the same two knobs.
+#   A window whose agent has EXITED is reused by the next launch in that folder, whatever
+#   agent the launch is for (found by @tclaude_path once the exact key lookup misses); a
+#   window with a live agent is never reused.
 #   PANES   : never touched -- split your own terminal in with Ctrl-b % / ".
 #   Every terminal that attaches gets its OWN throwaway GROUPED VIEW of the session, parked on
 #   its window. Two terminals can then show different windows of one session at the same time
@@ -167,7 +180,7 @@ _tclaude_file_title() {
   local line t
   line="$(tail -c 4194304 "$1" 2>/dev/null | LC_ALL=C grep -aF '"type":"custom-title"' | tail -1)"
   [ -n "$line" ] || return 0
-  t="$(printf '%s' "$line" | grep -aoE '"customTitle":"(\\\\.|[^"\\\\])*"' | head -1)"
+  t="$(printf '%s' "$line" | grep -aoE '"customTitle":"(\\.|[^"\\])*"' | head -1)"
   t="${t#*:\"}"; t="${t%\"}"
   printf '%s' "$t" | sed -e 's/\\\(.\)/\1/g'
 }
@@ -178,6 +191,23 @@ _tclaude_file_title() {
 # label (fb4a stays fb4a), but brought back as the tiebreaker if that skip would leave two
 # windows identically named. uuid-shaped ids never label. All values are sanitized with the
 # same class the creation path uses, so the two naming sites agree.
+# A window label as the user wrote it. Windows are addressed by @id everywhere in this file,
+# so a title may hold spaces, brackets and punctuation without breaking a tmux target; only
+# control characters and whitespace runs are tidied, and one matching pair of surrounding
+# quotes comes off (claude stores a /rename argument verbatim, quotes included). Squeezing
+# everything else into "_" is what turned "[NR] Errors" into __NR__Errors_ on a tab.
+_tclaude_label_clean() {
+  local t="$1"
+  t="$(printf '%s' "$t" | LC_ALL=C tr -s '[:cntrl:][:space:]' ' ')"
+  t="${t## }"; t="${t%% }"
+  if [ ${#t} -ge 2 ]; then
+    case "$t" in
+      \"*\"|\'*\') t="${t[2,-2]}"; t="${t## }"; t="${t%% }" ;;
+    esac
+  fi
+  printf '%s' "$t"
+}
+
 _tclaude_relabel() {
   emulate -L zsh
   local sess="$1"
@@ -190,7 +220,7 @@ _tclaude_relabel() {
     [ -n "${parts[2]-}" ] || continue
     ids+=("$parts[1]"); paths+=("$parts[2]")
     resumes+=("$(printf '%s' "${parts[3]-}" | tr -c 'A-Za-z0-9._-' '_')")
-    local wt="$(printf '%s' "${parts[4]-}" | tr -c 'A-Za-z0-9._-' '_')"
+    local wt="$(_tclaude_label_clean "${parts[4]-}")"
     # a /rename inside claude lands in the session file; pick it up so the tab follows.
     # The file path is derivable from what we stamp: claude keys its projects dir by the
     # folder with non-alphanumerics turned into "-".
@@ -198,7 +228,7 @@ _tclaude_relabel() {
       local sfile="$HOME/.claude/projects/$(printf '%s' "$parts[2]" | tr -c 'A-Za-z0-9' '-')/${parts[3]}.jsonl"
       local ft="$(_tclaude_file_title "$sfile")"
       if [ -n "$ft" ]; then
-        ft="$(printf '%s' "$ft" | tr -c 'A-Za-z0-9._-' '_')"
+        ft="$(_tclaude_label_clean "$ft")"
         if [ "$ft" != "$wt" ]; then
           wt="$ft"
           tmux set-option -w -t "$parts[1]" @tclaude_title "$ft" 2>/dev/null
@@ -304,6 +334,39 @@ _tclaude_mint_view() {
   printf '%s\n' "$view"
 }
 
+# Is an agent still running in the pane whose shell is PANE_PID? Looks at the shell's direct
+# children only -- running t-claude from inside the very window it reuses makes our own command
+# substitutions children of that shell, and a child is the job we launched, not a grandchild of
+# something else. A child matches when its argv[0] basename IS one of the labels, STARTS with
+# one (a launcher script and the <label>.real it execs both count), or it is the nosync-wrap
+# shim running one. Never a mere mention: `less ~/src/t-claude/...` is not a running claude. A
+# suspended (Ctrl-Z) job still matches, so a stopped session never gets a second agent stacked
+# on it. Empty labels are skipped. Returns 0 when alive.
+_tclaude_pane_alive() {   # PANE_PID LABEL...
+  local pane_pid="$1" kid kcmd base label
+  shift
+  [ -n "$pane_pid" ] || return 1
+  for kid in $(pgrep -P "$pane_pid" 2>/dev/null); do
+    kcmd="$(ps -o command= -p "$kid" 2>/dev/null)"
+    [ -n "$kcmd" ] || continue
+    base="${${kcmd%% *}:t}"
+    # An agent that is a script shows its interpreter as argv[0] and itself as argv[1];
+    # only then is the second word consulted, so `less .../claude` never counts.
+    local second=""
+    case "$base" in
+      sh|bash|zsh|dash|ksh|env|python|python[23]*|node|perl|ruby)
+        second="${kcmd#* }"; second="${${second%% *}:t}" ;;
+    esac
+    for label in "$@"; do
+      [ -n "$label" ] || continue
+      case "$base" in "$label"|"$label"?*) return 0 ;; esac
+      case "$second" in "$label"|"$label"?*) return 0 ;; esac
+      case "$kcmd" in *"nosync-wrap $label"|*"nosync-wrap $label "*) return 0 ;; esac
+    done
+  done
+  return 1
+}
+
 t-claude() {
   # Function-snapshot shells (zsh snapshots like claude's ! bash mode) can carry t-claude
   # without its helpers; re-source the file from wherever this host keeps it. Proceeding
@@ -323,6 +386,7 @@ t-claude() {
   _tclaude_use_patched_tmux
 
   local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0
+  local agent_cmd="${TCLAUDE_AGENT_CMD-}" agent_label="${TCLAUDE_AGENT_LABEL:-claude}"
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
   # identity is keyed off this, and $PWD is not stable for one directory: on many setups
@@ -399,6 +463,13 @@ t-claude() {
       --title=*) title="${1#--title=}"; shift ;;
       --title)
         if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then title="$2"; shift 2; else shift; fi ;;
+      --agent-cmd=*) agent_cmd="${1#--agent-cmd=}"; shift ;;
+      --agent-cmd)
+        # The value is a whole command line and may well start with "-": take it verbatim.
+        if [ -n "${2-}" ]; then agent_cmd="$2"; shift 2; else shift; fi ;;
+      --agent-label=*) agent_label="${1#--agent-label=}"; shift ;;
+      --agent-label)
+        if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then agent_label="$2"; shift 2; else shift; fi ;;
       *) passthrough+=("$1"); shift ;;
     esac
   done
@@ -422,6 +493,11 @@ t-claude() {
     session="main"
   fi
 
+  # The label names a process and is compared against argv[0] basenames, so it is kept to
+  # the characters a command name has; empty falls back to claude.
+  agent_label="$(printf '%s' "$agent_label" | tr -c 'A-Za-z0-9._-' '_')"
+  [ -n "$agent_label" ] || agent_label=claude
+
   key="$(printf '%s' "$folder" | cksum | awk '{print $1}')_$(printf '%s' "$tcid" | cksum | awk '{print $1}')"
   # --title labels the window instead of the folder basename (relabel keeps it verbatim).
   [ -n "$title" ] && title="$(printf '%s' "$title" | tr -c 'A-Za-z0-9._-' '_')"
@@ -438,7 +514,7 @@ t-claude() {
   # `nosync-wrap claude ...`, so the shell runs nosync-wrap and the function is skipped -- a flag
   # can't be exported, so it belongs in this command.
   local wrap=""; command -v nosync-wrap >/dev/null 2>&1 && wrap="nosync-wrap "
-  local flags="--dangerously-skip-permissions --effort ultracode"
+  local flags="--dangerously-skip-permissions --effort high"
 
   # SESSION-FOLLOW HOOKS. Claude can switch the id a window is showing mid-run: /branch and
   # /clear each mint a NEW session id, and /cd moves the conversation to another folder. Left
@@ -632,7 +708,10 @@ HOOKSJSON
   local -a _hist; _hist=("$projdir"/*.jsonl(N))
 
   local inner
-  if [ -n "$resume" ]; then inner="${wrap}claude --resume ${(q)resume} $flags$hooks_flag$extra"
+  # --agent-cmd replaces the whole claude line: the caller has already chosen the binary, its
+  # flags, and whether to wrap it, so nothing below (hooks, defaults, passthrough) is added.
+  if [ -n "$agent_cmd" ]; then inner="$agent_cmd"
+  elif [ -n "$resume" ]; then inner="${wrap}claude --resume ${(q)resume} $flags$hooks_flag$extra"
   elif [ -n "$sid" ]; then inner="${wrap}claude --session-id ${(q)sid} $flags$hooks_flag$extra"
   elif (( auto )) && (( ${#_hist} )); then inner="${wrap}claude --continue $flags$hooks_flag$extra"
   elif (( auto )); then inner="${wrap}claude $flags$hooks_flag$extra"
@@ -721,6 +800,30 @@ HOOKSJSON
     fi
   fi
 
+  # Still nothing: a window in this session for the SAME FOLDER whose agent has exited is
+  # the natural place for this launch, whichever agent made it and whichever agent this is
+  # -- the tab stays where the user left it instead of a dead shell tab sitting beside a
+  # new one. Only windows t-claude made (they carry @tclaude_key) qualify, and never one
+  # whose agent is still running: a live conversation is not a free slot. The window is
+  # re-keyed to this launch and the relaunch path below sends the command.
+  if [ -z "$win" ] && tmux has-session -t "=$session" 2>/dev/null; then
+    local eline ewin ekey epath elabel
+    local -a ef
+    for eline in "${(@f)$(tmux list-windows -t "=$session" -F $'#{window_id}\t#{@tclaude_key}\t#{@tclaude_path}\t#{@tclaude_agent}' 2>/dev/null)}"; do
+      # (@ps:\t:) keeps EMPTY fields; an IFS-tab read collapses adjacent tabs and shifts
+      # the path into the key slot on a window with no key
+      ef=("${(@ps:\t:)eline}")
+      ewin="${ef[1]-}"; ekey="${ef[2]-}"; epath="${ef[3]-}"; elabel="${ef[4]-}"
+      [ -n "$ewin" ] && [ -n "$ekey" ] && [ "$epath" = "$folder" ] || continue
+      _tclaude_pane_alive "$(tmux display-message -p -t "$ewin" '#{pane_pid}' 2>/dev/null)" "${elabel:-claude}" "$agent_label" && continue
+      win="$ewin"
+      tmux set-option -w -t "$win" @tclaude_key "$key" 2>/dev/null
+      [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
+      printf "reusing this folder's window -- its %s had exited\n" "${elabel:-claude}" >&2
+      break
+    done
+  fi
+
   # nothing to reuse/move: add a new window (creating the session if needed).
   # An adopted pane counts as created: its launch line is already sent, and the
   # reuse path below would otherwise find no claude running yet (this shell has not
@@ -756,18 +859,13 @@ HOOKSJSON
   # substitutions children of that shell. A claude suspended with Ctrl-Z still matches, so a
   # stopped session never gets a second claude stacked on it.
   if [ "$created" = 0 ]; then
-    local pane_pid kid alive=0
+    local pane_pid alive=0
     pane_pid="$(tmux display-message -p -t "$win" '#{pane_pid}' 2>/dev/null)"
     if [ -n "$pane_pid" ]; then
-      local kcmd
-      for kid in $(pgrep -P "$pane_pid" 2>/dev/null); do
-        kcmd="$(ps -o command= -p "$kid" 2>/dev/null)"
-        # match the job we launch (claude, or the nosync-wrap shim running claude) -- NOT any
-        # argv that merely mentions a path with "claude" in it (less ~/src/t-claude/... is
-        # not a running claude)
-        case "${${kcmd%% *}:t}" in claude) alive=1; break ;; esac
-        case "$kcmd" in *"nosync-wrap claude"*) alive=1; break ;; esac
-      done
+      # Both the label this launch carries and the one the window was stamped with: a
+      # window found by key never stacks a second agent on a live one, whichever it is.
+      _tclaude_pane_alive "$pane_pid" "$agent_label" \
+        "$(tmux display-message -p -t "$win" '#{@tclaude_agent}' 2>/dev/null)" && alive=1
       if [ "$alive" = 0 ]; then
         # A killed claude leaves its terminal modes latched on the pane -- focus-reporting
         # (DECSET 1004) in particular. The shell at the prompt doesn't understand focus
@@ -777,7 +875,7 @@ HOOKSJSON
         tmux send-keys -R -t "$win" '' 2>/dev/null
         tmux send-keys -t "$win" C-u 2>/dev/null
         tmux send-keys -t "$win" "$cmd" Enter
-        printf "relaunched claude in this folder's window -- it had exited\n" >&2
+        printf "relaunched %s in this folder's window -- it had exited\n" "$agent_label" >&2
       fi
     fi
   fi
@@ -787,6 +885,7 @@ HOOKSJSON
   # older t-claude get labelled too. Then retitle the whole session (basename, extended on collision).
   tmux set-option -w -t "$win" @tclaude_path "$folder" 2>/dev/null
   tmux set-option -w -t "$win" @tclaude_resume "$tcid" 2>/dev/null
+  tmux set-option -w -t "$win" @tclaude_agent "$agent_label" 2>/dev/null
   # NATIVE SCROLLBACK, the two halves that need a tmux carrying the scroll-native
   # patch (github.com/ejc3/tmux, branch scroll-native); both are silently ignored
   # by a stock tmux, which is why they are set with the same 2>/dev/null as the
