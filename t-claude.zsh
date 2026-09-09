@@ -16,10 +16,13 @@
 #   - claude               Claude Code on PATH.
 #   - tmux (patched)       OPTIONAL: a tmux from github.com/ejc3/tmux branch scroll-native
 #                          adds scroll-passthrough and scroll-replay, which keep the OUTER
-#                          terminal's own scrollback correct (swipe-to-scroll on a phone).
-#                          Install it as tmux-scroll in ~/.local/bin or /usr/local/bin, or
-#                          point $TCLAUDE_TMUX at it; t-claude puts it first on PATH. Absent
-#                          -> a stock tmux works, minus native scrollback across big scrolls.
+#                          terminal's own scrollback correct (swipe-to-scroll on a phone);
+#                          branch altscreen-forward also mirrors a full-window pane's
+#                          alternate screen to the terminal, so less/vim stop scrolling
+#                          that scrollback away. Install it as tmux-scroll in ~/.local/bin
+#                          or /usr/local/bin, or point $TCLAUDE_TMUX at it; t-claude puts
+#                          it first on PATH. Absent -> a stock tmux works, minus native
+#                          scrollback across big scrolls.
 #   - nosync-wrap          /usr/local/bin/nosync-wrap -- a pty shim that strips Claude's
 #                          synchronized-output sequences (CSI ?2026h/l) so tmux does not
 #                          swallow scrollback. OPTIONAL: if absent, launches bare claude
@@ -28,7 +31,7 @@
 #                          out of shell history (see the `cmd=" $inner"` note below).
 #
 # NOT required: a pre-configured ~/.tmux.conf. Earlier versions depended on the host having
-# deployed the native-scrollback settings (smcup@/rmcup@, status off, indn@, mouse off) into
+# deployed the native-scrollback settings (clear-on-attach off, status off, indn@, mouse off) into
 # a static config file -- correct on the boxes that had it, silently broken (no scrollback,
 # no error) on any host where that file was missing, stale, or reverted. t-claude now sets
 # those options itself, at runtime, on every invocation -- see APPLY_SCROLLBACK_SETTINGS
@@ -94,6 +97,30 @@
 # prefixes. Found -> symlink it into a t-claude-owned bin dir and prepend that
 # (idempotent). None found -> leave PATH alone; the options below are set with
 # 2>/dev/null and a stock tmux ignores them, so the feature just degrades.
+# Keep tmux on the terminal's PRIMARY screen so the terminal's own scrollback holds the
+# session. Upstream tmux (next-3.8, Aug 2026) has an option for exactly this: clear-on-attach
+# off. Older tmux needs the blunt form, deleting smcup/rmcup from terminfo. The option is
+# preferred because it KEEPS the capability: the altscreen-forward build then uses it to put
+# a full-window less/vim on the terminal's alternate screen, so paging through a file no
+# longer scrolls the session's scrollback away (measured 140 leaked rows -> 0). With the
+# capability deleted that cannot work, so the smcup@ entry is removed when switching over.
+_tclaude_native_screen() {
+  local coa
+  coa="$(tmux show-options -sv clear-on-attach 2>/dev/null)"
+  if [ -n "$coa" ]; then
+    [ "$coa" = off ] || tmux set-option -s clear-on-attach off 2>/dev/null
+    local line
+    tmux show-options -g terminal-overrides 2>/dev/null | while IFS= read -r line; do
+      case "$line" in *'smcup@:rmcup@'*) tmux set-option -gu "${line%% *}" 2>/dev/null ;; esac
+    done
+  else
+    case "$(tmux show-options -gv terminal-overrides 2>/dev/null)" in
+      *'smcup@:rmcup@'*) ;;
+      *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;;
+    esac
+  fi
+}
+
 _tclaude_use_patched_tmux() {
   local shimdir="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/bin"
   case ":$PATH:" in *":$shimdir:"*)
@@ -862,6 +889,27 @@ tmux rename-window -t "$wid" "$name" 2>/dev/null
 exit 0
 TSYNC
   chmod +x "$tsync" 2>/dev/null
+
+  # resize-settle: a phone terminal reports a new size before its viewport has finished changing
+  # (Prompt, measured: a keyboard toggle is one to six size reports over up to four seconds), so
+  # the full repaint tmux sends for each report lands on a geometry the terminal has already left,
+  # leaving the bottom rows stale. Repaint once
+  # more after the LAST resize of a burst: every event writes a token and sleeps; only the latest
+  # one repaints, at 0.6 s and again at 1.6 s. A helper FILE for the same reason as title-sync.sh.
+  local rsettle="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/resize-settle"
+  cat > "$rsettle" <<'RSETTLE'
+#!/bin/sh
+# args: socket_path client_name  (written by t-claude; regenerated every launch)
+sock="$1"; c="$2"; [ -n "$c" ] || exit 0
+f="$(dirname "$0")/settle.$(printf '%s' "$c" | tr -c 'A-Za-z0-9' _)"
+tok="$$.$(date +%s%N)"; printf '%s' "$tok" > "$f"
+for delay in 0.6 1.0; do
+  sleep "$delay"
+  [ "$(cat "$f" 2>/dev/null)" = "$tok" ] || exit 0
+  tmux -S "$sock" refresh-client -t "$c" 2>/dev/null
+done
+RSETTLE
+  chmod +x "$rsettle" 2>/dev/null
   # GLOBAL, not per-session (measured on a live server): when a window is displayed
   # through a grouped view -- which is how every t-claude client attaches -- tmux runs
   # pane-title-changed in the VIEW session's context, so a hook on the home session
@@ -889,11 +937,12 @@ TSYNC
   # one in their own context, which is fine -- view churn is not topology.
   tmux set-hook -g window-linked "run-shell -b \"[ -x ${(q)khooks}/topology-snap ] && ${(q)khooks}/topology-snap #{q:socket_path} || true\"" 2>/dev/null
   tmux set-hook -g window-unlinked "run-shell -b \"[ -x ${(q)khooks}/topology-snap ] && ${(q)khooks}/topology-snap #{q:socket_path} || true\"" 2>/dev/null
+  tmux set-hook -g client-resized "run-shell -b \"[ -x ${(q)khooks}/resize-settle ] && ${(q)khooks}/resize-settle #{q:socket_path} #{q:client_name} || true\"" 2>/dev/null
   tmux bind-key M choose-tree -Zs "run-shell -b \"if [ -x ${(q)khooks}/key-move ]; then ${(q)khooks}/key-move '#{socket_path}' '#{pane_id}' '%%'; else tmux move-window -s '#{window_id}' -t '%%:'; fi\"" 2>/dev/null
   tmux bind-key B run-shell -b "[ -x ${(q)khooks}/key-branch ] && ${(q)khooks}/key-branch #{q:socket_path} #{q:pane_id} || true" 2>/dev/null
+  _tclaude_native_screen
   local overrides
   overrides="$(tmux show-options -gv terminal-overrides 2>/dev/null)"
-  case "$overrides" in *'smcup@:rmcup@'*) ;; *) tmux set-option -ga terminal-overrides ',*:smcup@:rmcup@' 2>/dev/null ;; esac
   case "$overrides" in *'indn@'*) ;; *) tmux set-option -ga terminal-overrides ',*:indn@' 2>/dev/null ;; esac
   # Sync mode on the OUTPUT side only. nosync-wrap strips claude's CSI ?2026h/l on the way IN,
   # so tmux cannot buffer a whole repaint into one viewport update and swallow the scrolled
