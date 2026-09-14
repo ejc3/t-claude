@@ -179,6 +179,28 @@ _tclaude_win_suffix() {
 # Latest custom title (/rename) recorded in a claude session file, reading only the last
 # 4MB -- renames are appended, so anything recent is near the end; a title set long ago is
 # already on the window from launch. Escape-aware: a title containing \" must not truncate.
+# When a live process already holds the name claude wants, it takes "<name>-<adjective>-<noun>"
+# instead, writes that as a custom-title like any other, and records the swap in the transcript
+# as a system notice: 'goes by "my-claw", so this session is now "my-claw-polymorphic-hollerith"'.
+# Measured on a live session: after one clash every later custom-title line carried the generated
+# name (252 of them), so no amount of walking back finds the name the user chose. The notice does:
+# it names both, it is written once per clash, and it outlives the process that caused it.
+# FILE NAME -> the name the user asked for when NAME is one claude generated on a clash, else NAME.
+_tclaude_uncollide() {
+  local f="$1" n="$2" map base i
+  [ -r "$f" ] && [ -n "$n" ] || { printf '%s' "$n"; return 0; }
+  map="$(LC_ALL=C grep -aF '"subtype":"informational"' "$f" 2>/dev/null \
+    | LC_ALL=C grep -aoE 'goes by \\"[^\\]*\\", so this session is now \\"[^\\]*\\"' \
+    | sed -e 's/^goes by \\"\([^\\]*\)\\", so this session is now \\"\([^\\]*\)\\"$/\2	\1/')"
+  for i in 1 2 3; do   # a clash while already carrying a generated name chains
+    base="$(printf '%s\n' "$map" | awk -F'\t' -v n="$n" '$1==n {b=$2} END {print b}')"
+    [ -n "$base" ] || break
+    n="$base"
+  done
+  printf '%s' "$n"
+}
+
+# The newest custom-title claude wrote, mapped back to the user's name if claude generated it.
 _tclaude_file_title() {
   [ -r "$1" ] || return 0
   local line t
@@ -186,7 +208,8 @@ _tclaude_file_title() {
   [ -n "$line" ] || return 0
   t="$(printf '%s' "$line" | grep -aoE '"customTitle":"(\\.|[^"\\])*"' | head -1)"
   t="${t#*:\"}"; t="${t%\"}"
-  printf '%s' "$t" | sed -e 's/\\\(.\)/\1/g'
+  t="$(printf '%s' "$t" | sed -e 's/\\\(.\)/\1/g')"
+  _tclaude_uncollide "$1" "$t"
 }
 
 # Title every t-claude window in SESSION. The label is the explicit --title when one was
@@ -983,10 +1006,25 @@ line="$(tail -c 4194304 "$file" 2>/dev/null | LC_ALL=C grep -aF '"type":"custom-
 [ -n "$line" ] || exit 0
 name="$(printf '%s' "$line" | LC_ALL=C grep -aoE '"customTitle":"(\\.|[^"\\])*"' | head -1)"
 name="${name#*:\"}"; name="${name%\"}"
-name="$(printf '%s' "$name" | sed -e 's/\\\(.\)/\1/g' | tr -c 'A-Za-z0-9._-' '_')"
+name="$(printf '%s' "$name" | sed -e 's/\\\(.\)/\1/g')"
 [ -n "$name" ] || exit 0
-# "$name"-* : _tclaude_relabel may have added a tie-break suffix; leave its choice alone
-case "$cur" in "$name"|"$name"-*) exit 0 ;; esac
+# A name claude generated on a clash ("<name>-<adjective>-<noun>") is recorded in the transcript
+# as a system notice naming both. Map it back to the name the user chose before showing it.
+map="$(LC_ALL=C grep -aF '"subtype":"informational"' "$file" 2>/dev/null \
+  | LC_ALL=C grep -aoE 'goes by \\"[^\\]*\\", so this session is now \\"[^\\]*\\"' \
+  | sed -e 's/^goes by \\"\([^\\]*\)\\", so this session is now \\"\([^\\]*\)\\"$/\2	\1/')"
+for i in 1 2 3; do
+  base="$(printf '%s\n' "$map" | awk -F'\t' -v n="$name" '$1==n {b=$2} END {print b}')"
+  [ -n "$base" ] || break
+  name="$base"
+done
+name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+# "$name"-* : _tclaude_relabel may have added a tie-break suffix; leave its choice alone. A tab
+# already carrying a name claude generated on a clash looks the same, so let that one heal.
+case "$cur" in "$name") exit 0 ;; esac
+case "$cur" in
+  "$name"-*) printf '%s\n' "$map" | awk -F'\t' -v c="$cur" '$1==c {f=1} END {exit !f}' || exit 0 ;;
+esac
 tmux set-option -w -t "$wid" @tclaude_title "$name" 2>/dev/null
 tmux rename-window -t "$wid" "$name" 2>/dev/null
 exit 0
