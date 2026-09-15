@@ -1116,6 +1116,15 @@ RSETTLE
   local widx
   widx="$(tmux list-windows -t "=$session" -F $'#{window_id}\t#{window_index}' 2>/dev/null | awk -F'\t' -v w="$win" '$1==w{print $2; exit}')"
   if [ -n "${TMUX-}" ]; then
+    # A control-mode client (tmux -CC, as used by cmux's multiplexer or iTerm2) is an app
+    # mirroring this server, not a person looking at one window. Switching it moves the app's
+    # view out from under it, and the app drops the workspace this was typed in. The window
+    # already exists in $session, and a mirroring app shows new windows on its own, so leave
+    # that client where it is.
+    if [ "$(tmux display-message -p '#{client_control_mode}' 2>/dev/null)" = 1 ]; then
+      printf 'window %s ready in session %s (a control-mode client is mirroring this server; not switching it)\n' "$winname" "$session" >&2
+      return 0
+    fi
     # Never park a client on the real session: every client attached to $session itself
     # shares its single current-window pointer, so two tabs that each ran this from inside
     # tmux would change windows in lockstep from then on. A client already on one of this
