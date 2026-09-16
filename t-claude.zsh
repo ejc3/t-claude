@@ -1670,7 +1670,10 @@ HOOKSJSON
   # unrelated tab still routes to that group rather than dragging this window into it.
   local adopted=0 here="" here_home=""
   if [ -n "${TMUX-}" ] && [ -t 0 ] && [ "${TCLAUDE_ADOPT_PANE:-1}" = 1 ]; then
-    here="$(tmux display-message -p '#{window_id}' 2>/dev/null)"
+    # Name this shell's own pane. An untargeted display-message answers for the client's current
+    # window, and under a control-mode client such as cmux's that is whichever window the client
+    # last selected, not the window this command runs in.
+    [ -n "${TMUX_PANE-}" ] && here="$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)"
     if [ -n "$here" ]; then
       # The client may be attached to a linked view (cmux's mirror, or t-claude's own
       # __tcv__), where `#{session_name}` names the view rather than the window's home.
