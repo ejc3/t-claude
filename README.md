@@ -31,6 +31,11 @@ tmux SERVER  (one per machine)
   the folder basename.
 - **`--session-id <uuid>`** — like `--resume` for the window key, but starts the
   conversation under a chosen id (see the header comment for how a wrapper uses this).
+- **Scrollback** — t-claude launches Claude with `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`.
+  Claude's fullscreen renderer draws on the terminal's alternate screen, which has no
+  scrollback at all, so the conversation can never be scrolled back to — the rest of the
+  scrollback stack (`smcup@`, `indn@`, `nosync-wrap`) cannot help once that is on. Export
+  `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=0` to keep fullscreen instead.
 - **`--take-window`** — detaches every other terminal parked on the window before showing it.
   **Off by default**; sharing is what t-claude has always done. Useful when a window has
   several viewers: a tmux window has one grid, so the extra ones render at someone else's size

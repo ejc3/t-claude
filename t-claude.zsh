@@ -606,6 +606,20 @@ t-claude() {
   local wrap=""; command -v nosync-wrap >/dev/null 2>&1 && wrap="nosync-wrap "
   local flags="--dangerously-skip-permissions --effort high"
 
+  # Claude's fullscreen renderer draws on the terminal's ALTERNATE screen, and an alternate
+  # screen has no scrollback at all -- the conversation never scrolls, so there is nothing for
+  # a phone swipe to reach and nothing for tmux to keep (measured on a box running 2.1.278:
+  # alternate_on=1 with 4 lines of pane history after hours of work). That defeats the whole
+  # native-scrollback stack above it: smcup@/indn@, the window-size rules and nosync-wrap all
+  # keep lines flowing into scrollback, and this one renderer stops them ever being written.
+  # Fullscreen became the default renderer, so t-claude asks for Claude's own opt-out.
+  #
+  # It goes in the LAUNCH LINE rather than being exported here: the window's shell is a child
+  # of the tmux SERVER and never inherits this function's environment. `:-1` leaves the choice
+  # open -- export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=0 (in your shell or via
+  # `tmux set-environment -g`) and fullscreen comes back, at the cost of scrollback.
+  local altscreen='CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1} '
+
   # SESSION-FOLLOW HOOKS. Claude can switch the id a window is showing mid-run: /branch and
   # /clear each mint a NEW session id, and /cd moves the conversation to another folder. Left
   # alone, the window keeps pointing at the id/folder it launched with -- the tab title tracks
@@ -805,12 +819,12 @@ HOOKSJSON
   # --agent-cmd replaces the whole claude line: the caller has already chosen the binary, its
   # flags, and whether to wrap it, so nothing below (hooks, defaults, passthrough) is added.
   if [ -n "$agent_cmd" ]; then inner="$agent_cmd"
-  elif [ -n "$resume" ]; then inner="${wrap}claude --resume ${(q)resume} $flags$hooks_flag$extra"
-  elif [ -n "$sid" ]; then inner="${wrap}claude --session-id ${(q)sid} $flags$hooks_flag$extra"
-  elif (( auto )) && (( ${#_hist} )); then inner="${wrap}claude --continue $flags$hooks_flag$extra"
-  elif (( auto )); then inner="${wrap}claude $flags$hooks_flag$extra"
-  elif (( ${#_hist} )); then inner="${wrap}claude --resume $flags$hooks_flag$extra"
-  else inner="${wrap}claude $flags$hooks_flag$extra"; fi
+  elif [ -n "$resume" ]; then inner="${altscreen}${wrap}claude --resume ${(q)resume} $flags$hooks_flag$extra"
+  elif [ -n "$sid" ]; then inner="${altscreen}${wrap}claude --session-id ${(q)sid} $flags$hooks_flag$extra"
+  elif (( auto )) && (( ${#_hist} )); then inner="${altscreen}${wrap}claude --continue $flags$hooks_flag$extra"
+  elif (( auto )); then inner="${altscreen}${wrap}claude $flags$hooks_flag$extra"
+  elif (( ${#_hist} )); then inner="${altscreen}${wrap}claude --resume $flags$hooks_flag$extra"
+  else inner="${altscreen}${wrap}claude $flags$hooks_flag$extra"; fi
 
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
   # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
