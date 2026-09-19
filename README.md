@@ -31,6 +31,13 @@ tmux SERVER  (one per machine)
   the folder basename.
 - **`--session-id <uuid>`** — like `--resume` for the window key, but starts the
   conversation under a chosen id (see the header comment for how a wrapper uses this).
+- **`--share-window`** — leaves other terminals attached. By default, running t-claude in a
+  **new terminal takes** the window it shows: any other terminal parked on that window is
+  detached first, since a tmux window has one grid, so extra viewers render at someone else's
+  size and lose native scrollback. Control-mode clients (`tmux -CC`, e.g. cmux's mirror) are
+  never detached, and running t-claude from **inside** tmux detaches nobody — a command in a
+  pane cannot tell tmux which terminal typed it, and guessing wrong detaches the wrong person.
+  `TCLAUDE_EVICT_VIEWERS=0` makes sharing the default again.
 - If a folder's window already exists in a **different** session, t-claude *moves* it to
   the session you asked for, live, without killing Claude.
 - Only windows t-claude created carry `@tclaude_key`, so your **manual windows are never**
