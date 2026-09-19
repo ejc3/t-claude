@@ -1,4 +1,5 @@
-# t-claude [SESSION] [--resume <id> | --session-id <uuid>] [--title <label>] [CLAUDE_ARGS...]
+# t-claude [SESSION] [--resume <id> | --session-id <uuid>] [--title <label>] [--share-window]
+#          [CLAUDE_ARGS...]
 #
 # Anything t-claude does not itself recognise is passed straight through to the `claude`
 # invocation, unmodified and in order -- e.g. `t-claude --remote-control` or
@@ -70,6 +71,17 @@
 #                   reopening one. A wrapper can hand out a deterministic id on the first run
 #                   and `--resume` the same id ever after; both runs land in the same window.
 #                   uuid-shaped ids are kept out of window titles (they key, they don't label).
+#   --share-window : leave other terminals attached to this window. By DEFAULT a launch from a
+#                   bare terminal TAKES the window it is about to show: every other client
+#                   parked on it is detached, because a tmux window has ONE grid and the extra
+#                   viewers end up rendering at somebody else's size, which silently costs
+#                   them native scrollback (see the window-size note in
+#                   APPLY_SCROLLBACK_SETTINGS). Never detached: control-mode clients (tmux
+#                   -CC), which mirror the whole server for an app rather than one window. A
+#                   launch from INSIDE tmux detaches nobody -- it cannot tell which client
+#                   typed it (see _tclaude_evict_window_viewers) -- and a launch with no tty
+#                   attaches nothing, so boot launchers evict nobody either.
+#                   TCLAUDE_EVICT_VIEWERS=0 makes sharing the default again.
 #   --agent-cmd <cmd> : run THIS shell command in the window instead of the claude line
 #                   t-claude would build (no hooks, no default flags -- the caller owns the
 #                   whole command, quoting included). --resume/--session-id still key and
@@ -316,6 +328,51 @@ _tclaude_relabel() {
   done
 }
 
+# Kick other terminals off a window before showing it here. A tmux WINDOW has ONE grid, so
+# every extra client on it is looking at somebody else's size: tmux sizes the window for the
+# most recently used client (window-size latest) and repaints the others inside a DECSTBM
+# scrolling region -- and a terminal DISCARDS the lines that scroll out of a region, so native
+# scrollback silently stops working for them. Measured on 2026-09-19: four clients (51x26,
+# 51x26, 51x29, 51x44) on two windows, and the two whose size did not match the grid lost
+# swipe-scrollback entirely while the matching two kept it.
+#
+# NOT evicted, ever:
+#   - the client this launch is running from ($self), which is the one being handed the window.
+#   - control-mode clients (tmux -CC). Those mirror the whole server for an app such as cmux or
+#     iTerm2, so detaching one closes the user's entire workspace rather than one view of one
+#     window -- the same reason the attach path below leaves them where they are.
+#
+# ONLY the bare-terminal attach path calls this, and that is deliberate. A launch from INSIDE
+# tmux cannot tell which client typed it: a command run in a pane is issued by an unattached
+# command client, so tmux answers `#{client_name}` with the session's most recently ACTIVE
+# client, and one byte from another viewer -- a keystroke, or the focus report a terminal
+# sends when its window gains focus, since focus-events defaults to on -- makes that client
+# the answer. Measured on 3.7b: with two terminals on one window, a single focus byte inverted
+# it, and the terminal that had just typed t-claude was the one detached. Reading the name
+# earlier in the run only narrows that race, it does not close it (measured: still inverted),
+# and a wrong detach cannot be undone from the detached side. So from inside tmux t-claude
+# switches its own client and leaves other viewers alone; a new terminal takes the window.
+#
+# Opt out with --share-window on a single launch (in TCLAUDE_ARGS too), or
+# `export TCLAUDE_EVICT_VIEWERS=0` for good. Sharing a window then behaves as it always did:
+# the newest client sets the size and the older ones go janky.
+_tclaude_evict_window_viewers() {
+  local win="$1"
+  [ -n "$win" ] || return 0
+  [ "${TCLAUDE_EVICT_VIEWERS:-1}" = 1 ] || return 0
+  local name cwin ctrl
+  # list-clients evaluates the format in each client's own context, so #{window_id} is the
+  # window THAT client is showing, not a global.
+  tmux list-clients -F $'#{client_name}\t#{window_id}\t#{client_control_mode}' 2>/dev/null \
+  | while IFS=$'\t' read -r name cwin ctrl; do
+      [ "$cwin" = "$win" ] || continue
+      [ "$name" != "$self" ] || continue
+      [ "$ctrl" = 1 ] && continue
+      tmux detach-client -t "$name" 2>/dev/null || true
+    done
+  return 0
+}
+
 # Create a grouped view of SESSION parked for WIN and print its name. A view shares the
 # session's windows but has its own current-window pointer, which is what lets each tab
 # show a different window. The hooks and options are load-bearing; their reasons are in
@@ -412,7 +469,7 @@ t-claude() {
   # Prefer a patched tmux (scroll-passthrough/scroll-replay) if one is installed.
   _tclaude_use_patched_tmux
 
-  local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0
+  local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0 share_window=0
   local agent_cmd="${TCLAUDE_AGENT_CMD-}" agent_label="${TCLAUDE_AGENT_LABEL:-claude}"
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
@@ -481,6 +538,7 @@ t-claude() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --auto) auto=1; shift ;;
+      --share-window) share_window=1; shift ;;
       --resume=*) resume="${1#--resume=}"; shift ;;
       --resume)
         if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then resume="$2"; shift 2; else shift; fi ;;
@@ -500,6 +558,11 @@ t-claude() {
       *) passthrough+=("$1"); shift ;;
     esac
   done
+
+  # --share-window is the per-launch form of TCLAUDE_EVICT_VIEWERS=0. Declared `local` because
+  # t-claude is SOURCED into the user's shell: a bare assignment would silently change every
+  # later launch in that terminal. zsh's dynamic scope carries it into the evict helper.
+  if [ "$share_window" = 1 ]; then local TCLAUDE_EVICT_VIEWERS=0; fi
 
   # One id drives the window key and title: --resume wins if both were given. They differ only
   # in which flag the inner claude gets, so a first run under --session-id and every later run
@@ -683,6 +746,10 @@ HOOKSJSON
   local -a defaults; defaults=(${=TCLAUDE_ARGS:-})
   local d dseen
   for d in $defaults; do
+    # t-claude's own flags are consumed by the parser above, which never sees TCLAUDE_ARGS.
+    # Relaying one to claude would end every launch in that shell with an unknown-flag exit,
+    # so honour it here instead.
+    if [ "$d" = --share-window ]; then local TCLAUDE_EVICT_VIEWERS=0; continue; fi
     dseen=0
     for pel in $passthrough; do
       [[ "$pel" == "$d" || "$pel" == "$d="* ]] && { dseen=1; break }
@@ -1147,6 +1214,7 @@ RSETTLE
     # Replay scrollback above the visible screen before attaching -- tmux repaints only the visible
     # pane on attach, so native scrollback would otherwise start empty. capture-pane -S - -E -1 dumps
     # exactly the history above the screen (measured 60/60, 0 dupes); tmux's repaint supplies the rest.
+    _tclaude_evict_window_viewers "$win"
     local hist
     hist="$(tmux display-message -p -t "$win" '#{history_size}' 2>/dev/null)"
     if [ -n "$hist" ] && [ "$hist" -gt 0 ] 2>/dev/null; then
