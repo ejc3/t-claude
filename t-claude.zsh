@@ -1,4 +1,4 @@
-# t-claude [SESSION] [--resume <id> | --session-id <uuid>] [--title <label>] [--share-window]
+# t-claude [SESSION] [--resume <id> | --session-id <uuid>] [--title <label>] [--take-window]
 #          [CLAUDE_ARGS...]
 #
 # Anything t-claude does not itself recognise is passed straight through to the `claude`
@@ -71,17 +71,16 @@
 #                   reopening one. A wrapper can hand out a deterministic id on the first run
 #                   and `--resume` the same id ever after; both runs land in the same window.
 #                   uuid-shaped ids are kept out of window titles (they key, they don't label).
-#   --share-window : leave other terminals attached to this window. By DEFAULT a launch from a
-#                   bare terminal TAKES the window it is about to show: every other client
-#                   parked on it is detached, because a tmux window has ONE grid and the extra
-#                   viewers end up rendering at somebody else's size, which silently costs
-#                   them native scrollback (see the window-size note in
-#                   APPLY_SCROLLBACK_SETTINGS). Never detached: control-mode clients (tmux
-#                   -CC), which mirror the whole server for an app rather than one window. A
-#                   launch from INSIDE tmux detaches nobody -- it cannot tell which client
-#                   typed it (see _tclaude_evict_window_viewers) -- and a launch with no tty
-#                   attaches nothing, so boot launchers evict nobody either.
-#                   TCLAUDE_EVICT_VIEWERS=0 makes sharing the default again.
+#   --take-window : detach every other terminal parked on this window before showing it. OFF
+#                   by default; sharing is what t-claude has always done. Worth asking for
+#                   when a window has several viewers: a tmux window has ONE grid, so the
+#                   extra ones render at somebody else's size, which silently costs them
+#                   native scrollback (see the window-size note in APPLY_SCROLLBACK_SETTINGS).
+#                   Never detached: control-mode clients (tmux -CC), which mirror the whole
+#                   server for an app rather than one window. Honoured only for a launch from
+#                   a bare terminal: from INSIDE tmux t-claude cannot tell which client typed
+#                   it (see _tclaude_evict_window_viewers), and a launch with no tty attaches
+#                   nothing. `export TCLAUDE_EVICT_VIEWERS=1` makes it the default.
 #   --agent-cmd <cmd> : run THIS shell command in the window instead of the claude line
 #                   t-claude would build (no hooks, no default flags -- the caller owns the
 #                   whole command, quoting included). --resume/--session-id still key and
@@ -353,13 +352,14 @@ _tclaude_relabel() {
 # and a wrong detach cannot be undone from the detached side. So from inside tmux t-claude
 # switches its own client and leaves other viewers alone; a new terminal takes the window.
 #
-# Opt out with --share-window on a single launch (in TCLAUDE_ARGS too), or
-# `export TCLAUDE_EVICT_VIEWERS=0` for good. Sharing a window then behaves as it always did:
-# the newest client sets the size and the older ones go janky.
+# OFF by default: sharing a window is the long-standing behaviour and taking it away from
+# another terminal is not something to do behind the user's back. Ask for it with
+# --take-window on a single launch (in TCLAUDE_ARGS too), or `export TCLAUDE_EVICT_VIEWERS=1`
+# for good.
 _tclaude_evict_window_viewers() {
   local win="$1"
   [ -n "$win" ] || return 0
-  [ "${TCLAUDE_EVICT_VIEWERS:-1}" = 1 ] || return 0
+  [ "${TCLAUDE_EVICT_VIEWERS:-0}" = 1 ] || return 0
   local name cwin ctrl
   # list-clients evaluates the format in each client's own context, so #{window_id} is the
   # window THAT client is showing, not a global.
@@ -469,7 +469,7 @@ t-claude() {
   # Prefer a patched tmux (scroll-passthrough/scroll-replay) if one is installed.
   _tclaude_use_patched_tmux
 
-  local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0 share_window=0
+  local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0 take_window=0
   local agent_cmd="${TCLAUDE_AGENT_CMD-}" agent_label="${TCLAUDE_AGENT_LABEL:-claude}"
   local -a passthrough
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
@@ -538,7 +538,7 @@ t-claude() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --auto) auto=1; shift ;;
-      --share-window) share_window=1; shift ;;
+      --take-window) take_window=1; shift ;;
       --resume=*) resume="${1#--resume=}"; shift ;;
       --resume)
         if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then resume="$2"; shift 2; else shift; fi ;;
@@ -559,10 +559,10 @@ t-claude() {
     esac
   done
 
-  # --share-window is the per-launch form of TCLAUDE_EVICT_VIEWERS=0. Declared `local` because
+  # --take-window is the per-launch form of TCLAUDE_EVICT_VIEWERS=1. Declared `local` because
   # t-claude is SOURCED into the user's shell: a bare assignment would silently change every
   # later launch in that terminal. zsh's dynamic scope carries it into the evict helper.
-  if [ "$share_window" = 1 ]; then local TCLAUDE_EVICT_VIEWERS=0; fi
+  if [ "$take_window" = 1 ]; then local TCLAUDE_EVICT_VIEWERS=1; fi
 
   # One id drives the window key and title: --resume wins if both were given. They differ only
   # in which flag the inner claude gets, so a first run under --session-id and every later run
@@ -749,7 +749,7 @@ HOOKSJSON
     # t-claude's own flags are consumed by the parser above, which never sees TCLAUDE_ARGS.
     # Relaying one to claude would end every launch in that shell with an unknown-flag exit,
     # so honour it here instead.
-    if [ "$d" = --share-window ]; then local TCLAUDE_EVICT_VIEWERS=0; continue; fi
+    if [ "$d" = --take-window ]; then local TCLAUDE_EVICT_VIEWERS=1; continue; fi
     dseen=0
     for pel in $passthrough; do
       [[ "$pel" == "$d" || "$pel" == "$d="* ]] && { dseen=1; break }
