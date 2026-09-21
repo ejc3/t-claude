@@ -92,6 +92,14 @@
 #                   a child of its shell is named <name>, starts with <name> (a launcher and
 #                   its <name>.real), or is `nosync-wrap <name>`. TCLAUDE_AGENT_CMD and
 #                   TCLAUDE_AGENT_LABEL in the environment are the same two knobs.
+#   --inference-profile <name> : use claude-master for inference, repeat in fallback order.
+#                   Requires --inference-model <model>. The native master login, tools,
+#                   permissions and Remote Control remain Claude's. Cannot combine with
+#                   --agent-cmd. A live window is only attached, never restarted or switched.
+#                   An exited window relaunches with the saved profiles and model (across
+#                   /clear, /branch and /cd); a different launch reusing the window, or
+#                   --agent-cmd taking it over, starts without them and clears them.
+#                   Cannot combine with --agent-label.
 #   A window whose agent has EXITED is reused by the next launch in that folder, whatever
 #   agent the launch is for (found by @tclaude_path once the exact key lookup misses); a
 #   window with a live agent is never reused.
@@ -463,6 +471,7 @@ _tclaude_pane_alive() {   # PANE_PID LABEL...
       case "$base" in "$label"|"$label"?*) return 0 ;; esac
       case "$second" in "$label"|"$label"?*) return 0 ;; esac
       case "$kcmd" in *"nosync-wrap $label"|*"nosync-wrap $label "*) return 0 ;; esac
+      case "$kcmd" in *"nosync-wrap $label-"*|*"nosync-wrap $label."*) return 0 ;; esac
     done
   done
   return 1
@@ -602,6 +611,87 @@ _tclaude_type() {   # PANE LAUNCH-LINE CACHE-DIR -- the file is written here, fr
   tmux send-keys -t "$1" -l -- "$typed" && tmux send-keys -t "$1" Enter
 }
 
+# Only profile names and a model (not credentials) are kept in a window's options. Validate
+# them again when recovering an exited window, before constructing any shell command.
+_tclaude_inference_command() {
+  emulate -L zsh
+  local model="$1" profile; shift
+  if [[ "$model" == *[[:space:]]* ]]; then
+    print -u2 -r -- 't-claude: invalid --inference-model (no whitespace)'
+    return 1
+  fi
+  if [ -z "$model" ] || [ "$#" -eq 0 ] || [ "$#" -gt 16 ]; then
+    print -u2 -r -- 't-claude: inference profiles require --inference-model and at least one --inference-profile'
+    return 1
+  fi
+  local -a seen args
+  for profile in "$@"; do
+    if [[ ${#profile} -gt 64 || "$profile" != [A-Za-z0-9]* || "$profile" == *[^A-Za-z0-9_-]* ]]; then
+      print -u2 -r -- 't-claude: invalid inference profile name (use 1-64 letters, digits, underscores or hyphens, starting with a letter or digit)'
+      return 1
+    fi
+    if (( ${seen[(Ie)$profile]} )); then
+      print -u2 -r -- "t-claude: duplicate inference profile: $profile"
+      return 1
+    fi
+    if (( ${#seen} == 0 )); then args=(claude-master run "$profile")
+    else args+=(--fallback-profile "$profile"); fi
+    seen+=("$profile")
+  done
+  args+=(--model "$model" --)
+  print -r -- "${(j: :)${(@q)args}}"
+}
+
+_tclaude_launch_line() {
+  emulate -L zsh
+  local folder="$1" inner="$2"
+  print -r -- " cd -- ${(q)folder} && { $inner; tcrc=\$?; if [ \$tcrc -eq 0 ] || { [ \$tcrc -gt 128 ] && { [ \$tcrc -lt 145 ] || [ \$tcrc -gt 148 ]; }; }; then exit \$tcrc; fi; }"
+}
+
+# Called only immediately before launching an idle/new pane, never while attaching to an
+# existing process. zsh's dynamic scope updates t-claude's local launch variables. The
+# window's profiles and model live in ONE option, written before any command is sent: a failed
+# write stops the launch, and anything but a complete saved value fails closed on a later
+# relaunch instead of silently using native master inference. They belong to the window's
+# AGENT: they survive /clear, /branch and /cd (the same claude-master process carries on, and
+# session-sync re-keys the window), and t-claude clears them only when it re-keys the window
+# for a different launch -- reuse by folder, or adopting a pane another conversation ran in. A missing claude-master
+# fails in the pane (command not found keeps the window open) -- it is looked up where it
+# runs, not in the caller's environment. --agent-cmd taking the window over clears it.
+_tclaude_prepare_inference_window() {
+  local target="$1" saved
+  saved="$(tmux show-options -wqv -t "$target" @tclaude_inference)" || return 1
+  if (( ! inference_requested )) && [[ -n "$saved" ]]; then
+    local -a w; w=(${=saved})
+    # Taken over by another agent: the saved inference no longer describes the window.
+    if [ -n "$agent_cmd" ]; then
+      tmux set-option -wu -t "$target" @tclaude_inference || return 1
+      return 0
+    fi
+    # v2 = "profiles-v2 MODEL PROFILE..."; anything else (v1 carried a key before the model)
+    # fails closed rather than being read with its fields shifted.
+    if [ "${w[1]-}" != profiles-v2 ] || (( ${#w} < 3 )); then
+      print -u2 -r -- 't-claude: this window has saved inference profiles; use explicit --inference-profile and --inference-model to replace incomplete or incompatible settings'
+      return 1
+    fi
+    if [ "$agent_label" != claude ]; then   # see the --agent-label check in t-claude
+      print -u2 -r -- 't-claude: this window has saved inference profiles, which cannot run under --agent-label or TCLAUDE_AGENT_LABEL'
+      return 1
+    fi
+    inference_model="${w[2]}"
+    inference_profiles=("${(@)w[3,-1]}")
+    inference_command="$(_tclaude_inference_command "$inference_model" "${inference_profiles[@]}")" || return 1
+    inner="${altscreen}${wrap}${inference_command}${native_args}"
+    cmd="$(_tclaude_launch_line "$folder" "$inner")"
+  fi
+  if (( ${#inference_profiles} )); then
+    # ONE option, one write, under the launch lock: a failed write stops the launch and leaves
+    # the previous value whole, and it always describes the command that then runs.
+    tmux set-option -w -t "$target" @tclaude_inference "profiles-v2 $inference_model ${inference_profiles[*]}" || return 1
+  fi
+  return 0
+}
+
 t-claude() {
   emulate -L zsh
   local IFS=$' \t\n\0'
@@ -609,12 +699,12 @@ t-claude() {
   # without its helpers; re-source the file from wherever this host keeps it. Proceeding
   # helper-less would be worse than failing: _tclaude_is_uuid would "fail" on every uuid
   # and the managed flag below would be stripped from managed windows.
-  if [ -z "${functions[_tclaude_is_uuid]-}" ]; then
+  if [ -z "${functions[_tclaude_is_uuid]-}" ] || [ -z "${functions[_tclaude_prepare_inference_window]-}" ]; then
     local _theal
     for _theal in "$HOME/.config/t-claude.zsh" /usr/local/lib/fcvm/t-claude.zsh "$HOME/.config/fcvm-t-claude.zsh"; do
       [ -f "$_theal" ] && source "$_theal" && break
     done
-    if [ -z "${functions[_tclaude_is_uuid]-}" ]; then
+    if [ -z "${functions[_tclaude_is_uuid]-}" ] || [ -z "${functions[_tclaude_prepare_inference_window]-}" ]; then
       printf 't-claude: helper functions missing and no source file found to reload\n' >&2
       return 1
     fi
@@ -624,7 +714,8 @@ t-claude() {
 
   local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0 take_window=0
   local agent_cmd="${TCLAUDE_AGENT_CMD-}" agent_label="${TCLAUDE_AGENT_LABEL:-claude}"
-  local -a passthrough
+  local inference_model="" inference_command="claude" inference_requested=0
+  local -a passthrough inference_profiles
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
   # identity is keyed off this, and $PWD is not stable for one directory: on many setups
   # HOME=/home/u is a symlink to /mnt/vol/u, so `cd ~/work` leaves $PWD=/home/u/work in one
@@ -708,6 +799,21 @@ t-claude() {
       --agent-label=*) agent_label="${1#--agent-label=}"; shift ;;
       --agent-label)
         if [ -n "${2-}" ] && [ "${2#-}" = "${2-}" ]; then agent_label="$2"; shift 2; else shift; fi ;;
+      --inference-profile=*)
+        inference_profiles+=("${1#--inference-profile=}"); inference_requested=1; shift ;;
+      --inference-profile)
+        if [ -z "${2-}" ] || [[ "$2" == -* ]]; then
+          print -u2 -r -- 't-claude: --inference-profile requires a profile name'; return 1
+        fi
+        inference_profiles+=("$2"); inference_requested=1; shift 2 ;;
+      --inference-model=*)
+        inference_model="${1#--inference-model=}"; inference_requested=1; shift ;;
+      --inference-model)
+        if [ -z "${2-}" ] || [[ "$2" == -* ]]; then
+          print -u2 -r -- 't-claude: --inference-model requires a model'; return 1
+        fi
+        inference_model="$2"; inference_requested=1; shift 2 ;;
+      --) passthrough+=("$@"); break ;;
       *) passthrough+=("$1"); shift ;;
     esac
   done
@@ -716,6 +822,20 @@ t-claude() {
   # t-claude is SOURCED into the user's shell: a bare assignment would silently change every
   # later launch in that terminal. zsh's dynamic scope carries it into the evict helper.
   if [ "$take_window" = 1 ]; then local TCLAUDE_EVICT_VIEWERS=1; fi
+
+  if (( inference_requested )); then
+    if [ -n "$agent_cmd" ]; then
+      print -u2 -r -- 't-claude: --inference-profile cannot be combined with --agent-cmd or TCLAUDE_AGENT_CMD'
+      return 1
+    fi
+    # The liveness check finds the agent by this label, and claude-master is found as claude:
+    # under another label a running profile launch would look dead and get a second one.
+    if [ "$agent_label" != claude ]; then
+      print -u2 -r -- 't-claude: --inference-profile cannot be combined with --agent-label or TCLAUDE_AGENT_LABEL'
+      return 1
+    fi
+    inference_command="$(_tclaude_inference_command "$inference_model" "${inference_profiles[@]}")" || return 1
+  fi
 
   # One id drives the window key and title: --resume wins if both were given. They differ only
   # in which flag the inner claude gets, so a first run under --session-id and every later run
@@ -979,16 +1099,17 @@ HOOKSJSON
   local projdir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${folder//[^A-Za-z0-9]/-}"
   local -a _hist; _hist=("$projdir"/*.jsonl(N))
 
-  local inner
+  local inner native_args
   # --agent-cmd replaces the whole claude line: the caller has already chosen the binary, its
   # flags, and whether to wrap it, so nothing below (hooks, defaults, passthrough) is added.
+  if [ -n "$resume" ]; then native_args=" --resume ${(q)resume} $flags$hooks_flag$extra"
+  elif [ -n "$sid" ]; then native_args=" --session-id ${(q)sid} $flags$hooks_flag$extra"
+  elif (( auto )) && (( ${#_hist} )); then native_args=" --continue $flags$hooks_flag$extra"
+  elif (( auto )); then native_args=" $flags$hooks_flag$extra"
+  elif (( ${#_hist} )); then native_args=" --resume $flags$hooks_flag$extra"
+  else native_args=" $flags$hooks_flag$extra"; fi
   if [ -n "$agent_cmd" ]; then inner="$agent_cmd"
-  elif [ -n "$resume" ]; then inner="${altscreen}${wrap}claude --resume ${(q)resume} $flags$hooks_flag$extra"
-  elif [ -n "$sid" ]; then inner="${altscreen}${wrap}claude --session-id ${(q)sid} $flags$hooks_flag$extra"
-  elif (( auto )) && (( ${#_hist} )); then inner="${altscreen}${wrap}claude --continue $flags$hooks_flag$extra"
-  elif (( auto )); then inner="${altscreen}${wrap}claude $flags$hooks_flag$extra"
-  elif (( ${#_hist} )); then inner="${altscreen}${wrap}claude --resume $flags$hooks_flag$extra"
-  else inner="${altscreen}${wrap}claude $flags$hooks_flag$extra"; fi
+  else inner="${altscreen}${wrap}${inference_command}${native_args}"; fi
 
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
   # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
@@ -1007,7 +1128,7 @@ HOOKSJSON
   # and anything launched from it dies on process.cwd. cd by absolute path re-resolves
   # through the live mount, healing such a shell; in a fresh window it is a no-op. If even
   # the cd fails the launch stops there and the shell stays for the error.
-  cmd=" cd -- ${(q)folder} && { $inner; tcrc=\$?; if [ \$tcrc -eq 0 ] || { [ \$tcrc -gt 128 ] && { [ \$tcrc -lt 145 ] || [ \$tcrc -gt 148 ]; }; }; then exit \$tcrc; fi; }"
+  cmd="$(_tclaude_launch_line "$folder" "$inner")"
 
   # A new window sized for that terminal is pinned (window-size manual) until the terminal
   # shows it; this puts its own window-size back, chained onto the attach/switch below.
@@ -1059,9 +1180,13 @@ HOOKSJSON
     if [ -n "$here_home" ] && [ "$here_home" = "$session" ]; then
       win="$here"
       adopted=1
+      # A pane that ran ANOTHER conversation's agent: its saved inference is that agent's.
+      [ "$(tmux show-options -wqv -t "$win" @tclaude_key 2>/dev/null)" = "$key" ] ||
+        tmux set-option -wu -t "$win" @tclaude_inference 2>/dev/null
       tmux set-option -w -t "$win" @tclaude_key "$key" 2>/dev/null
       [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
       # This pane's own shell runs the line once t-claude returns: nothing to wait for.
+      _tclaude_prepare_inference_window "$win" || return 1
       _tclaude_type "${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}" "$cmd" "$tcache" && launched=1
     fi
   fi
@@ -1115,6 +1240,8 @@ HOOKSJSON
       _tclaude_shell_at_prompt "$ewin" "$epid" || continue
       win="$ewin"
       tmux set-option -w -t "$win" @tclaude_key "$key" 2>/dev/null
+      # Re-keyed for this launch: the exited agent's saved inference was that agent's, not this.
+      tmux set-option -wu -t "$win" @tclaude_inference 2>/dev/null
       [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
       printf "reusing this folder's window -- its %s had exited\n" "${elabel:-claude}" >&2
       break
@@ -1145,6 +1272,7 @@ HOOKSJSON
       return 1
     fi
     tmux set-option -w -t "$win" @tclaude_key "$key"
+    _tclaude_prepare_inference_window "$win" || return 1
     local new_pane new_pid ws
     read -r new_pane new_pid <<< "$(tmux display-message -p -t "$win" '#{pane_id} #{pane_pid}' 2>/dev/null)"
     if [[ "$attach_cols" == <1-> && "$attach_rows" == <1-> ]]; then
@@ -1191,6 +1319,7 @@ HOOKSJSON
       elif [ "$alive" = 0 ] && _tclaude_pane_alive "$pane_pid" "$agent_label" "$stamped"; then
         :   # its agent came up while we waited: attach to it
       elif [ "$alive" = 0 ]; then
+        _tclaude_prepare_inference_window "$win" || return 1
         # A killed claude leaves its terminal modes latched on the pane -- focus-reporting
         # (DECSET 1004) in particular. The shell at the prompt doesn't understand focus
         # escapes, so the next client attach can splice ^[[I/^[[O into the line we are about
@@ -1205,6 +1334,8 @@ HOOKSJSON
           (( own )) || _tclaude_await_agent "$pane_id" "$pane_pid" "$agent_label"
           printf "relaunched %s in this folder's window -- it had exited\n" "$agent_label" >&2
         fi
+      elif (( inference_requested )); then
+        print -u2 -r -- 't-claude: attaching to the running window; inference profiles/model were not changed. Exit Claude first, then run this command again to change them.'
       fi
     fi
   fi
