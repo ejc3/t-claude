@@ -104,6 +104,22 @@
 # Safety: only windows WE create carry @tclaude_key, so manual windows are never found,
 # reused, renamed, moved, or closed.
 
+# SHELL OPTIONS. This file is sourced from ~/.zshrc, so it is parsed and its functions run with
+# whatever options the user's shell has: SH_GLOB made `*(N)` a parse error and t-claude was
+# never defined, KSH_ARRAYS shifted every array index, NOUNSET/NO_CLOBBER/GLOB_SUBST each broke
+# something else. Re-source it under `emulate zsh -c`: that parses it with zsh's own options
+# and makes every function defined here STICKY -- it runs with them too, whatever the caller
+# has set. The caller's own options are untouched. Only a real file that is this one can be
+# re-read (%x of `source <(...)` is a pipe already partly consumed, and of an `eval` in an rc
+# file is that rc file); anything else is defined as it is read, as before. t-claude itself
+# also starts with `emulate -L zsh` and the default IFS (which no option resets), so a copy of
+# it without sticky options -- a function snapshot -- runs the same way.
+if [[ "${_TCLAUDE_EMULATED-}" != "${(%):-%x}" && -f "${(%):-%x}" ]] &&
+   grep -q '^# SHELL OPTIONS\. This file is sourced' "${(%):-%x}" 2>/dev/null; then
+  _TCLAUDE_EMULATED="${(%):-%x}" emulate zsh -c 'source "$_TCLAUDE_EMULATED"'
+  return
+fi
+
 # True when $1 is uuid-shaped: 36 chars, hex plus exactly four dashes. Used to keep machine
 # ids out of window titles -- a uuid disambiguates the window KEY, but as a label it's noise
 # ("myrepo" beats "myrepo-2f3a4b5c-..."). Short human ids ("my-diffs") still show.
@@ -452,6 +468,8 @@ _tclaude_pane_alive() {   # PANE_PID LABEL...
 }
 
 t-claude() {
+  emulate -L zsh
+  local IFS=$' \t\n\0'
   # Function-snapshot shells (zsh snapshots like claude's ! bash mode) can carry t-claude
   # without its helpers; re-source the file from wherever this host keeps it. Proceeding
   # helper-less would be worse than failing: _tclaude_is_uuid would "fail" on every uuid
