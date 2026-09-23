@@ -19,10 +19,11 @@ if [[ "${1-}" == --case ]]; then
   _tclaude_use_patched_tmux() { :; }
   _tclaude_relabel() { :; }
   _tclaude_native_screen() { :; }
-  _tclaude_pane_alive() { return 1; }
+  _tclaude_pane_alive() { [[ -e "$TEST_ROOT/typed" ]]; }   # the agent runs once it is typed
   stty() { print -r -- '-icanon'; }
   tmux() {
     print -r -- "$*" >> "$TEST_ROOT/tmux"
+    [[ "$1 ${@[-1]}" == 'send-keys Enter' ]] && : >| "$TEST_ROOT/typed"
     case "$*" in
       new-window*) print -r -- '@1' ;;
       *'#{pane_id}') print -r -- %1 ;;
@@ -42,8 +43,8 @@ test_checks=0
 fail() { print -u2 -r -- "FAIL: $* (fixtures: $test_root)"; exit 1; }
 check() { (( test_checks++ )); "$@" || fail "$*"; }
 for opt in SH_GLOB KSH_ARRAYS NOUNSET NO_CLOBBER GLOB_SUBST NO_MULTIOS IFS_NEWLINE PIPE STALE_GUARD_VAR SNAPSHOT; do
-  : > "$test_root/tmux"; : > "$test_root/stderr"
-  HOME="$test_root/home" XDG_CACHE_HOME="$test_root/cache" CLAUDE_CONFIG_DIR="$test_root/claude" \
+  : > "$test_root/tmux"; : > "$test_root/stderr"; rm -f "$test_root/typed"
+  HOME="$test_root/home" XDG_CACHE_HOME="$test_root/cache" CLAUDE_CONFIG_DIR="$test_root/claude" TMUX_TMPDIR="$test_root/tmux-tmp" \
     TEST_ROOT="$test_root" TEST_OPT="$opt" TMUX= TMUX_PANE= TCLAUDE_ARGS= \
     zsh -f "$0" --case > "$test_root/out" 2>&1 || fail "$opt: $(<"$test_root/out") $(<"$test_root/stderr")"
   # The launch reached the pane: whole line, or the launch file that holds it.

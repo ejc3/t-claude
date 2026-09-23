@@ -7,7 +7,7 @@ setopt pipefail
 local_repo="${0:A:h:h}"
 source "$local_repo/t-claude.zsh" || exit 1
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/tclaude-hyperlink-tests.XXXXXXXX")" || exit 1
-export XDG_CACHE_HOME="$test_root/cache" CLAUDE_CONFIG_DIR="$test_root/claude"
+export XDG_CACHE_HOME="$test_root/cache" CLAUDE_CONFIG_DIR="$test_root/claude" TMUX_TMPDIR="$test_root/tmux-tmp"
 unset TMUX TMUX_PANE TCLAUDE_ARGS TCLAUDE_AGENT_CMD TCLAUDE_AGENT_LABEL FORCE_HYPERLINK TERM_PROGRAM_VERSION
 mkdir -p "$test_root/project"
 cd "$test_root/project" || exit 1
@@ -19,14 +19,16 @@ contains() { [[ "$1" == *"$2"* ]]; }
 _tclaude_use_patched_tmux() { :; }
 _tclaude_relabel() { :; }
 _tclaude_native_screen() { :; }
-_tclaude_pane_alive() { return 1; }
+_tclaude_pane_alive() { [[ -e "$test_root/typed" ]]; }   # the agent runs once it is typed
 nosync-wrap() { "$@"; }
+stty() { print -r -- 'speed 38400 baud; -icanon'; }   # the new pane's line editor is up
 claude() { print -r -- "${TERM_PROGRAM_VERSION-unset}" > "$test_root/env"; return 1; }
 
 reset_case() {
   test_sent="" test_features="$1"
   : > "$test_root/tmux"
   : > "$test_root/env"
+  rm -f "$test_root/typed"
 }
 
 tmux() {
@@ -34,9 +36,16 @@ tmux() {
   case "$1" in
     has-session) return 0 ;;
     new-window) print -r -- '@1' ;;
-    display-message) [[ "$argv[-1]" == '#{pane_pid}' ]] && print -r -- 12345 ;;
+    display-message)
+      case "$argv[-1]" in
+        '#{pane_pid}') print -r -- 12345 ;;
+        '#{pane_id} #{pane_pid}') print -r -- '%1 12345' ;;
+        '#{pane_tty}') print -r -- /dev/null ;;
+        '#{pid}') print -r -- 999 ;;
+      esac ;;
     show-options) [[ "$argv[-1]" == terminal-features ]] && print -r -- "${test_features// /$'\n'}" ;;
-    send-keys) [[ "$argv[-1]" == Enter ]] && test_sent="$argv[-2]" ;;
+    # The pane is typed ` . <launch file>`; record what that file runs.
+    send-keys) [[ "$argv[-2]" == -- && "$argv[-3]" == -l ]] && { test_sent="$(<"${(Q)${argv[-1]# . }}")"; : > "$test_root/typed"; } ;;
     kill-session) fail 'test attempted to kill a tmux session' ;;
   esac
   return 0

@@ -29,7 +29,8 @@
 #                          swallow scrollback. OPTIONAL: if absent, launches bare claude
 #                          (scrollback breaks, everything else works).
 #   - HIST_IGNORE_SPACE    set in ~/.zshrc -- lets the space-prefixed launch command stay
-#                          out of shell history (see the `cmd=" $inner"` note below).
+#                          out of shell history (see the `cmd=" $inner"` note below; the
+#                          typed ` . <launch file>` line carries the space).
 #
 # NOT required: a pre-configured ~/.tmux.conf. Earlier versions depended on the host having
 # deployed the native-scrollback settings (clear-on-attach off, status off, indn@, mouse off) into
@@ -467,6 +468,140 @@ _tclaude_pane_alive() {   # PANE_PID LABEL...
   return 1
 }
 
+# LAUNCH TYPING. The launch line is typed into a pane's shell, and a pane should read like a
+# bare terminal: one short prompt line, then claude. Typed whole, the line wrapped over four or
+# more rows and a new window showed it TWICE (9 rows above claude's banner, measured, where a
+# bare terminal shows `> claude`): the keys arrived before the shell's line editor started, so
+# the tty echoed them raw and the editor redrew them after its prompt. Everything here is
+# synchronous -- nothing is left running after t-claude returns.
+#   - _tclaude_launch_file puts the line in a launch file of its own (mktemp: never rewritten or
+#     shared) that deletes itself as its first command, and returns ` . /abs/path` to type --
+#     sourced, so `exit` in it still closes the window and claude is still the shell's job for
+#     Ctrl-Z/fg; absolute because the pane's HOME need not be the caller's; single-quoted unless
+#     plain, against expansion and `!` history expansion. No usable cache: the whole line.
+#   - Only a window t-claude has JUST created waits for its shell's line editor, which takes the
+#     pane tty out of canonical mode while it reads a line (zsh, bash; measured 100-150ms).
+#     Nothing else can be running in that pane, so -icanon there means the prompt. Every other
+#     pane is at a prompt already (an exited agent's shell) or is the caller's own, and is typed
+#     at once, as before.
+#   - A new window is created at the size of the terminal about to show it: made at the
+#     session's size (80 columns with nobody attached) and reflowed on attach, a prompt line
+#     that had wrapped unwrapped and left a blank row above it.
+#   - _tclaude_launch_lock serialises launches on a tmux server, from finding (or creating) the
+#     window to seeing its agent running: two t-claudes cannot both create a window for one
+#     conversation, both find one idle and type, or re-key one under each other. A kernel
+#     flock beside the server's socket: a holder that dies releases it, and a launch that
+#     cannot take it (timeout, no flock) launches nothing.
+#   - An existing window is typed into only when its shell OWNS the terminal -- no foreground
+#     job (_tclaude_shell_at_prompt) -- and its agent is still not running after that wait: never
+#     into less, vim, a build, an agent that is starting. A window whose shell is busy is not
+#     reused for another launch either (it keeps its key and saved inference). The caller's
+#     own pane is typed at once: its shell runs the line when t-claude returns.
+#   - Keys go to the PANE that was checked, never to whichever pane of the window is active.
+_tclaude_launch_file() {   # LAUNCH-LINE CACHE-DIR -- prints the text to type
+  local line="$1" dir="$2/launch" f
+  mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null
+  find "$dir" -type f -mmin +1440 -delete 2>/dev/null   # files whose launch never ran
+  if f="$(mktemp "$dir/launch.XXXXXX" 2>/dev/null)" &&
+     print -r -- "command rm -f -- ${(q)f}"$'\n'"$line" > "$f" 2>/dev/null; then
+    if [[ "$f" =~ '^[A-Za-z0-9/._-]+$' ]]; then print -r -- " . $f"; else print -r -- " . ${(qq)f}"; fi
+  else
+    [ -n "$f" ] && rm -f -- "$f"
+    print -r -- "$line"
+  fi
+}
+
+typeset -g _tclaude_lock_fd=""
+_tclaude_launch_lock() {   # -- 0 with the server's launch lock held (<= 20s wait); else nothing launches
+  _tclaude_launch_unlock   # one left behind by an interrupted run in this shell
+  local sock dir f mode
+  local -a retry
+  # Beside the server's socket, in tmux's own per-user 0700 directory (the server may not be
+  # running yet): every t-claude for one server finds the same file whatever its cache dir,
+  # and a symlinked TMUX_TMPDIR (macOS /tmp) resolves to the path $TMUX would carry. A socket
+  # in a directory that is not ours alone (`tmux -S /tmp/x`) keeps its lock in our own cache,
+  # named by the socket, where nobody else can plant or swap it.
+  sock="${TMUX:+${TMUX%%,*}}"; : "${sock:=${TMUX_TMPDIR:-/tmp}/tmux-$UID/default}"
+  mkdir -p -m 700 "${sock:h}" 2>/dev/null
+  dir="${sock:h:A}"
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  if [[ -O "$dir" ]] && zstat -A mode +mode "$dir" 2>/dev/null && (( (mode[1] & 8#077) == 0 )); then
+    f="$dir/${sock:t}.tclaude-launch.lock"
+  else
+    f="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/locks"
+    mkdir -p -m 700 "$f" 2>/dev/null
+    f="$f/launch-$(print -rn -- "$dir/${sock:t}" | cksum | cut -d' ' -f1)"
+  fi
+  # -i (retry every 50ms rather than every second) is zsh 5.9+; 5.8 rejects it.
+  autoload -Uz is-at-least && is-at-least 5.9 && retry=(-i 0.05)
+  if zmodload zsh/system 2>/dev/null && : >> "$f" 2>/dev/null &&
+     zsystem flock -t "${_tclaude_lock_wait:-20}" "${retry[@]}" -f _tclaude_lock_fd "$f"; then
+    return 0
+  fi
+  _tclaude_lock_fd=""
+  print -u2 -r -- "t-claude: could not take the launch lock $f (another launch still running, or no flock); nothing was launched"
+  return 1
+}
+_tclaude_launch_unlock() {
+  [[ -n "$_tclaude_lock_fd" ]] && { zsystem flock -u "$_tclaude_lock_fd"; } 2>/dev/null
+  _tclaude_lock_fd=""
+  return 0
+}
+
+# The pane's shell is at its prompt: it owns its terminal (it is the foreground process group,
+# so no job runs in the foreground) and, for a shell with a line editor, the editor is up (the
+# tty out of canonical mode) -- canonical there means a builtin such as `read` is waiting, or a
+# function such as another t-claude is running. A shell without an editor (dash) reads its
+# prompt in canonical mode, so owning the terminal is all it shows.
+_tclaude_shell_at_prompt() {   # PANE PANE-PID [POLLS] -- 0 once true (default: one look)
+  local n=0 fg sh tty
+  tty="$(tmux display-message -p -t "$1" '#{pane_tty}' 2>/dev/null)"
+  sh="$(ps -o comm= -p "$2" 2>/dev/null)"; sh="${${sh##*/}#-}"
+  while :; do
+    fg="$(ps -o tpgid= -p "$2" 2>/dev/null)"; fg="${fg//[^0-9]/}"
+    if [[ -n "$fg" && "$fg" == "$2" ]]; then
+      case "$sh" in
+        zsh|bash|fish|ksh|ksh93|mksh|yash|tcsh|elvish|nu|xonsh)
+          [[ -n "$tty" && "$(stty -a < "$tty" 2>/dev/null)" == *-icanon* ]] && return 0 ;;
+        *) return 0 ;;
+      esac
+    fi
+    (( n++ < ${3:-0} )) || return 1
+    sleep 0.05
+  done
+}
+
+_tclaude_await_editor() {   # PANE [POLLS] -- 0 once the pane's shell reads a line (default <= 3s)
+  local tty n=0
+  tty="$(tmux display-message -p -t "$1" '#{pane_tty}' 2>/dev/null)"
+  [[ -n "$tty" ]] || return 1
+  until [[ "$(stty -a < "$tty" 2>/dev/null)" == *-icanon* ]]; do
+    (( n++ < ${2:-60} )) || return 1
+    sleep 0.05
+  done
+}
+
+# Until the typed launch shows up as a process (<= 3s) -- or has already come and gone: its
+# launch file deleted (the shell sourced it) and the shell back at a prompt, as when claude
+# refuses to start. Without that a failing start held the lock for the full 3s.
+_tclaude_await_agent() {   # PANE PANE-PID LABEL...
+  local pane="$1" tty n=0; shift
+  tty="$(tmux display-message -p -t "$pane" '#{pane_tty}' 2>/dev/null)"
+  until _tclaude_pane_alive "$@" || (( n++ >= 60 )); do
+    [[ -n "$_tclaude_typed_file" && ! -e "$_tclaude_typed_file" && -n "$tty" &&
+       "$(stty -a < "$tty" 2>/dev/null)" == *-icanon* ]] && ! _tclaude_pane_alive "$@" && return 0
+    sleep 0.05
+  done
+}
+
+_tclaude_type() {   # PANE LAUNCH-LINE CACHE-DIR -- the file is written here, from the final line
+  [ -n "$1" ] || return 1   # an empty target is tmux's CURRENT pane: never type there
+  local typed; typed="$(_tclaude_launch_file "$2" "$3")"
+  # For _tclaude_await_agent: the launch file this typing sources ("" when the line went whole).
+  _tclaude_typed_file=""; [[ "$typed" == ' . '* ]] && _tclaude_typed_file="${(Q)${typed# . }}"
+  tmux send-keys -t "$1" -l -- "$typed" && tmux send-keys -t "$1" Enter
+}
+
 t-claude() {
   emulate -L zsh
   local IFS=$' \t\n\0'
@@ -874,6 +1009,28 @@ HOOKSJSON
   # the cd fails the launch stops there and the shell stays for the error.
   cmd=" cd -- ${(q)folder} && { $inner; tcrc=\$?; if [ \$tcrc -eq 0 ] || { [ \$tcrc -gt 128 ] && { [ \$tcrc -lt 145 ] || [ \$tcrc -gt 148 ]; }; }; then exit \$tcrc; fi; }"
 
+  # A new window sized for that terminal is pinned (window-size manual) until the terminal
+  # shows it; this puts its own window-size back, chained onto the attach/switch below.
+  local -a unpin
+  local _tclaude_typed_file="" launched=0
+
+  # From here until the window is stamped, this is the server's only launch (LAUNCH TYPING).
+  _tclaude_launch_lock || return 1
+  {
+  # The size of the terminal this launch will show the window in (see LAUNCH TYPING): known only
+  # with one -- a tty -- that is not a control-mode client, which is left where it is below.
+  local attach_cols="" attach_rows=""
+  if [ -t 0 ]; then
+    if [ -z "${TMUX-}" ]; then
+      read -r attach_rows attach_cols < <(stty size 2>/dev/null </dev/tty)
+    elif [ "$(tmux display-message -p '#{client_control_mode}' 2>/dev/null)" != 1 ] &&
+         [ "$(tmux list-clients 2>/dev/null | wc -l)" -eq 1 ]; then
+      # From a pane tmux can only name "the most recent client"; with one there is no doubt.
+      read -r attach_cols attach_rows <<< "$(tmux display-message -p '#{client_width} #{client_height}' 2>/dev/null)"
+    fi
+  fi
+
+
   # Called from a real tmux pane you are sitting in: that pane is where you asked for claude,
   # so make THIS window the session's window instead of minting another one and pulling the
   # client over to it. Without this, running t-claude from a shell tab always left that tab
@@ -904,7 +1061,8 @@ HOOKSJSON
       adopted=1
       tmux set-option -w -t "$win" @tclaude_key "$key" 2>/dev/null
       [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
-      tmux send-keys -t "$win" "$cmd" Enter
+      # This pane's own shell runs the line once t-claude returns: nothing to wait for.
+      _tclaude_type "${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}" "$cmd" "$tcache" && launched=1
     fi
   fi
 
@@ -927,8 +1085,7 @@ HOOKSJSON
     if [ -n "$hit" ]; then
       osess="${hit% *}"; owin="${hit#* }"; ph=""
       if ! tmux has-session -t "=$session" 2>/dev/null; then
-        tmux new-session -d -s "$session" -c "$folder"
-        ph="$(tmux list-windows -t "=$session" -F '#{window_id}' | head -1)"
+        ph="$(tmux new-session -d -P -F '#{window_id}' -s "$session" -c "$folder")"
       fi
       tmux move-window -s "$owin" -t "=$session:"
       [ -n "$ph" ] && tmux kill-window -t "$ph" 2>/dev/null
@@ -944,7 +1101,7 @@ HOOKSJSON
   # whose agent is still running: a live conversation is not a free slot. The window is
   # re-keyed to this launch and the relaunch path below sends the command.
   if [ -z "$win" ] && tmux has-session -t "=$session" 2>/dev/null; then
-    local eline ewin ekey epath elabel
+    local eline ewin ekey epath elabel epid
     local -a ef
     for eline in "${(@f)$(tmux list-windows -t "=$session" -F $'#{window_id}\t#{@tclaude_key}\t#{@tclaude_path}\t#{@tclaude_agent}' 2>/dev/null)}"; do
       # (@ps:\t:) keeps EMPTY fields; an IFS-tab read collapses adjacent tabs and shifts
@@ -952,7 +1109,10 @@ HOOKSJSON
       ef=("${(@ps:\t:)eline}")
       ewin="${ef[1]-}"; ekey="${ef[2]-}"; epath="${ef[3]-}"; elabel="${ef[4]-}"
       [ -n "$ewin" ] && [ -n "$ekey" ] && [ "$epath" = "$folder" ] || continue
-      _tclaude_pane_alive "$(tmux display-message -p -t "$ewin" '#{pane_pid}' 2>/dev/null)" "${elabel:-claude}" "$agent_label" && continue
+      epid="$(tmux display-message -p -t "$ewin" '#{pane_pid}' 2>/dev/null)"
+      _tclaude_pane_alive "$epid" "${elabel:-claude}" "$agent_label" && continue
+      # Nor one whose shell is running something: it keeps its key (and saved inference).
+      _tclaude_shell_at_prompt "$ewin" "$epid" || continue
       win="$ewin"
       tmux set-option -w -t "$win" @tclaude_key "$key" 2>/dev/null
       [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
@@ -976,8 +1136,7 @@ HOOKSJSON
       # did not, so every attempt to add a second window to an existing session failed.
       win="$(tmux new-window -d -P -F '#{window_id}' -t "=$session:" -n "$winname" -c "$folder")"
     else
-      tmux new-session -d -s "$session" -n "$winname" -c "$folder"
-      win="$(tmux list-windows -t "=$session" -F '#{window_id}' | head -1)"
+      win="$(tmux new-session -d -P -F '#{window_id}' -s "$session" -n "$winname" -c "$folder")"
     fi
     if [ -z "$win" ]; then
       # never fall through with an empty target: tmux resolves it to the CURRENT window and
@@ -986,7 +1145,23 @@ HOOKSJSON
       return 1
     fi
     tmux set-option -w -t "$win" @tclaude_key "$key"
-    tmux send-keys -t "$win" "$cmd" Enter
+    local new_pane new_pid ws
+    read -r new_pane new_pid <<< "$(tmux display-message -p -t "$win" '#{pane_id} #{pane_pid}' 2>/dev/null)"
+    if [[ "$attach_cols" == <1-> && "$attach_rows" == <1-> ]]; then
+      # Its own window-size (a hook's, or none), put back once the terminal shows the window.
+      ws="$(tmux show-options -wqv -t "$win" window-size 2>/dev/null)"
+      if [ -n "$ws" ]; then unpin=(set-option -w -t "$win" window-size "$ws")
+      else unpin=(set-option -wu -t "$win" window-size); fi
+      tmux resize-window -t "$win" -x "$attach_cols" -y "$attach_rows" 2>/dev/null
+    fi
+    _tclaude_await_editor "$new_pane"
+    if ! _tclaude_type "$new_pane" "$cmd" "$tcache"; then
+      (( ${#unpin} )) && tmux "${unpin[@]}" 2>/dev/null
+      printf "t-claude: the new window's pane is gone; nothing was launched\n" >&2
+      return 1
+    fi
+    launched=1
+    _tclaude_await_agent "$new_pane" "$new_pid" "$agent_label"
     created=1
   fi
 
@@ -996,23 +1171,40 @@ HOOKSJSON
   # substitutions children of that shell. A claude suspended with Ctrl-Z still matches, so a
   # stopped session never gets a second claude stacked on it.
   if [ "$created" = 0 ]; then
-    local pane_pid alive=0
-    pane_pid="$(tmux display-message -p -t "$win" '#{pane_pid}' 2>/dev/null)"
+    local pane_pid pane_id stamped alive=0 own=0
+    read -r pane_id pane_pid <<< "$(tmux display-message -p -t "$win" '#{pane_id} #{pane_pid}' 2>/dev/null)"
+    stamped="$(tmux display-message -p -t "$win" '#{@tclaude_agent}' 2>/dev/null)"
+    # The caller's own pane: THIS process is that pane's shell (not a background job or a script
+    # started from it, whose typed line something else would read). $sysparams: $$ is the
+    # parent's pid in a subshell.
+    zmodload zsh/system 2>/dev/null
+    [ -n "$pane_id" ] && [ "$pane_id" = "${TMUX_PANE-}" ] && [ "${sysparams[pid]:-$$}" = "$pane_pid" ] && own=1
     if [ -n "$pane_pid" ]; then
       # Both the label this launch carries and the one the window was stamped with: a
       # window found by key never stacks a second agent on a live one, whichever it is.
-      _tclaude_pane_alive "$pane_pid" "$agent_label" \
-        "$(tmux display-message -p -t "$win" '#{@tclaude_agent}' 2>/dev/null)" && alive=1
-      if [ "$alive" = 0 ]; then
+      _tclaude_pane_alive "$pane_pid" "$agent_label" "$stamped" && alive=1
+      # Only into a shell that owns its terminal (<= 1s), and whose agent has still not
+      # appeared after that wait: never into less, vim, a build, an agent that is starting.
+      # The caller's own pane is exempt: its shell runs the line once t-claude returns.
+      if [ "$alive" = 0 ] && (( ! own )) && ! _tclaude_shell_at_prompt "$pane_id" "$pane_pid" 20; then
+        printf "t-claude: this folder's window is running a command (its shell is not at a prompt); not relaunching\n" >&2
+      elif [ "$alive" = 0 ] && _tclaude_pane_alive "$pane_pid" "$agent_label" "$stamped"; then
+        :   # its agent came up while we waited: attach to it
+      elif [ "$alive" = 0 ]; then
         # A killed claude leaves its terminal modes latched on the pane -- focus-reporting
         # (DECSET 1004) in particular. The shell at the prompt doesn't understand focus
         # escapes, so the next client attach can splice ^[[I/^[[O into the line we are about
         # to type and the relaunch never executes (caught by acceptance testing: the line sat
         # as " nosync-^[[I^[[O"). Reset the pane's terminal state, clear the line, then type.
-        tmux send-keys -R -t "$win" '' 2>/dev/null
-        tmux send-keys -t "$win" C-u 2>/dev/null
-        tmux send-keys -t "$win" "$cmd" Enter
-        printf "relaunched %s in this folder's window -- it had exited\n" "$agent_label" >&2
+        if (( ! own )); then
+          tmux send-keys -R -t "$pane_id" '' 2>/dev/null
+          tmux send-keys -t "$pane_id" C-u 2>/dev/null
+        fi
+        if _tclaude_type "$pane_id" "$cmd" "$tcache"; then
+          launched=1
+          (( own )) || _tclaude_await_agent "$pane_id" "$pane_pid" "$agent_label"
+          printf "relaunched %s in this folder's window -- it had exited\n" "$agent_label" >&2
+        fi
       fi
     fi
   fi
@@ -1022,7 +1214,11 @@ HOOKSJSON
   # older t-claude get labelled too. Then retitle the whole session (basename, extended on collision).
   tmux set-option -w -t "$win" @tclaude_path "$folder" 2>/dev/null
   tmux set-option -w -t "$win" @tclaude_resume "$tcid" 2>/dev/null
-  tmux set-option -w -t "$win" @tclaude_agent "$agent_label" 2>/dev/null
+  # The label names what is RUNNING in the window: stamped by the launch that started it, never
+  # by one that only attached (its liveness checks would then look for the wrong process).
+  if [ "$launched" = 1 ] || [ -z "$(tmux show-options -wqv -t "$win" @tclaude_agent 2>/dev/null)" ]; then
+    tmux set-option -w -t "$win" @tclaude_agent "$agent_label" 2>/dev/null
+  fi
   # NATIVE SCROLLBACK, the two halves that need a tmux carrying the scroll-native
   # patch (github.com/ejc3/tmux, branch scroll-native); both are silently ignored
   # by a stock tmux, which is why they are set with the same 2>/dev/null as the
@@ -1217,6 +1413,12 @@ RSETTLE
     (( ${${(f)tfeat}[(Ie)${hpat}:hyperlinks]} )) || tmux set-option -sa terminal-features ",${hpat}:hyperlinks" 2>/dev/null
   done
 
+  } always {
+    _tclaude_launch_unlock
+    # Interrupted (Ctrl-C) before the attach that would unpin it: unpin now.
+    (( TRY_BLOCK_INTERRUPT || TRY_BLOCK_ERROR )) && (( ${#unpin} )) && tmux "${unpin[@]}" 2>/dev/null
+  }
+
   # ATTACH. Inside tmux already: just move this one client to the window. From a bare terminal
   # (a new cmux tab): attach a per-invocation GROUPED VIEW parked on this window -- it shares the
   # session's windows but has its own current-window pointer, so several tabs show different windows
@@ -1225,7 +1427,10 @@ RSETTLE
   # No tty means no human to hand the window to: a fleet bring-up, a claude ! bash-mode
   # invocation, or a hook is driving. The window is created/updated above; attaching (or
   # yanking the caller's client to a new view) would be wrong, so stop here.
+  local rc=0
+  {
   if ! [ -t 0 ]; then
+    if (( ${#unpin} )); then tmux "${unpin[@]}" 2>/dev/null; fi   # none without a tty; never left pinned
     printf 'window %s ready in session %s (not attaching: no terminal)\n' "$winname" "$session" >&2
     return 0
   fi
@@ -1254,12 +1459,15 @@ RSETTLE
     case "$cur" in
       "${session}__tcv__"*)
         [ -n "$widx" ] && tmux select-window -t "=${cur}:${widx}" 2>/dev/null
+        if (( ${#unpin} )); then tmux "${unpin[@]}" 2>/dev/null; fi   # the client shows it now
         ;;
       *)
         local view
         view="$(_tclaude_mint_view "$session" "$win")"
         [ -n "$widx" ] && tmux select-window -t "${view}:${widx}" 2>/dev/null
-        tmux switch-client -t "=$view"
+        tmux switch-client -t "=$view"; rc=$?
+        if (( ${#unpin} )); then tmux "${unpin[@]}" 2>/dev/null; fi   # the client shows it now
+        return $rc
         ;;
     esac
   else
@@ -1275,6 +1483,16 @@ RSETTLE
     local view
     view="$(_tclaude_mint_view "$session" "$win")"
     [ -n "$widx" ] && tmux select-window -t "${view}:${widx}" 2>/dev/null
-    tmux attach -d -t "=$view"
+    # Unpinned by the same tmux command, after the attach: this client is the one it sizes to.
+    local -a after; (( ${#unpin} )) && after=(';' "${unpin[@]}")
+    tmux attach -d -t "=$view" "${after[@]}"; rc=$?
+    # A failed attach skips the rest of that command: unpin here instead.
+    if (( rc )) && (( ${#unpin} )); then tmux "${unpin[@]}" 2>/dev/null; fi
+    return $rc
   fi
+  return 0
+  } always {
+    # Interrupted between the launch and the attach that would unpin the window: unpin now.
+    (( TRY_BLOCK_INTERRUPT || TRY_BLOCK_ERROR )) && (( ${#unpin} )) && tmux "${unpin[@]}" 2>/dev/null
+  }
 }
