@@ -637,6 +637,17 @@ t-claude() {
   # open -- export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=0 (in your shell or via
   # `tmux set-environment -g`) and fullscreen comes back, at the cost of scrollback.
   local altscreen='CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1} '
+  # Clickable links (OSC 8), so a URL that wraps -- the /login URL above all -- stays ONE link.
+  # Claude enables them inside tmux only for tmux >= 3.4 (the first with the `hyperlinks`
+  # feature), read from TERM_PROGRAM_VERSION -- which a patched build reports as "next-3.8",
+  # and that parses as NaN. So a bare terminal got one link and t-claude got plain text
+  # broken per row. Strip the prefix and Claude's own check passes; an older tmux still
+  # fails it, as it should. Better than FORCE_HYPERLINK, which claude's tool subprocesses
+  # would inherit and print links into output the model reads. tmux forwards OSC 8 only to
+  # a client with the `hyperlinks` feature (asserted below) and draws plain text otherwise.
+  # `:+` so a pane shell with nounset (set -u) does not abort when the variable is unset.
+  # FORCE_HYPERLINK=0 exported in the pane's shell (e.g. ~/.zshrc) turns links off.
+  altscreen+='TERM_PROGRAM_VERSION=${TERM_PROGRAM_VERSION:+${TERM_PROGRAM_VERSION#next-}} '
 
   # SESSION-FOLLOW HOOKS. Claude can switch the id a window is showing mid-run: /branch and
   # /clear each mint a NEW session id, and /cd moves the conversation to another folder. Left
@@ -1196,6 +1207,15 @@ RSETTLE
   local tfeat
   tfeat="$(tmux show-options -sv terminal-features 2>/dev/null)"
   case "$tfeat" in *sync*) ;; *) tmux set-option -sa terminal-features ',xterm-256color:sync' 2>/dev/null ;; esac
+  # tmux strips OSC 8 for a client without `hyperlinks`, and no stock default grants it. Like
+  # sync, features are read when a client ATTACHES: one already attached keeps its old set.
+  # Granted to the TERMs of terminals that render OSC 8 (xterm-* covers iTerm2, Ghostty,
+  # kitty, WezTerm, VS Code; tmux-* an enclosing tmux 3.4+), each by its exact entry so a
+  # user's entry for another pattern does not stand in for it.
+  local hpat
+  for hpat in 'xterm*' 'tmux*' 'alacritty*' 'foot*'; do
+    (( ${${(f)tfeat}[(Ie)${hpat}:hyperlinks]} )) || tmux set-option -sa terminal-features ",${hpat}:hyperlinks" 2>/dev/null
+  done
 
   # ATTACH. Inside tmux already: just move this one client to the window. From a bare terminal
   # (a new cmux tab): attach a per-invocation GROUPED VIEW parked on this window -- it shares the

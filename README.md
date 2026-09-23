@@ -36,6 +36,12 @@ tmux SERVER  (one per machine)
   scrollback at all, so the conversation can never be scrolled back to — the rest of the
   scrollback stack (`smcup@`, `indn@`, `nosync-wrap`) cannot help once that is on. Export
   `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=0` to keep fullscreen instead.
+- **Clickable links** — a wrapped URL (the `/login` one above all) is one clickable link, as
+  it is outside tmux. t-claude gives tmux clients the `hyperlinks` terminal feature (without
+  it tmux drops OSC 8 links) and hands Claude a `TERM_PROGRAM_VERSION` it can parse (a
+  patched tmux reports `next-3.8`, which fails Claude's tmux ≥ 3.4 check). A terminal already
+  attached picks the feature up on its next attach. `export FORCE_HYPERLINK=0` in the pane's
+  shell (e.g. `~/.zshrc`) turns links off.
 - **`--take-window`** — detaches every other terminal parked on the window before showing it.
   **Off by default**; sharing is what t-claude has always done. Useful when a window has
   several viewers: a tmux window has one grid, so the extra ones render at someone else's size

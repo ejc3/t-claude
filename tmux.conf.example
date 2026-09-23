@@ -31,3 +31,10 @@ set -g allow-passthrough on
 set -g monitor-bell on
 set -g bell-action any
 set -g visual-bell off
+
+# Forward clickable OSC 8 links to the terminal (tmux strips them without this feature), so a
+# wrapped URL such as Claude's /login one stays one link. t-claude also asserts this at runtime.
+set -as terminal-features ',xterm*:hyperlinks'
+set -as terminal-features ',tmux*:hyperlinks'
+set -as terminal-features ',alacritty*:hyperlinks'
+set -as terminal-features ',foot*:hyperlinks'
