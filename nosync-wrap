@@ -19,7 +19,7 @@ shell regains control. SIGCONT reverses it. SIGSTOP is used for the child rather
 than SIGTSTP because the child is a session leader in its own (orphaned) session,
 and POSIX discards stop signals sent to an orphaned process group.
 """
-import os, pty, re, sys, select, fcntl, termios, struct, signal, time, tty as ttymod
+import errno, os, pty, re, sys, select, fcntl, termios, struct, signal, time, tty as ttymod
 
 SUSP = b"\x1a"          # Ctrl-Z (VSUSP); raw mode means we must handle it ourselves
 
@@ -68,7 +68,13 @@ def main():
         sys.stderr.write("usage: nosync-wrap CMD [ARGS...]\n"); sys.exit(2)
     pid, fd = pty.fork()
     if pid == 0:
-        os.execvp(argv[0], argv)
+        try: os.execvp(argv[0], argv)
+        except (OSError, ValueError) as e:
+            # What the shell would say, with the shell's status: 127 not found (an empty name
+            # included), 126 not runnable.
+            missing = not argv[0] or getattr(e, "errno", None) == errno.ENOENT
+            sys.stderr.write("nosync-wrap: %s: %s\n" % (argv[0], "command not found" if missing else e.strerror))
+            os._exit(127 if missing else 126)
     def winch(*_):
         try:
             sz = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0"*8)
@@ -165,8 +171,13 @@ def main():
                 os.write(fd, data)
     finally:
         if restore: set_mode(0, old)
-    try: os.waitpid(pid, 0)
+    # Exit with the child's status, as if it had run unwrapped: the launch line decides from it
+    # whether the window closes (0, or a signal death) or stays so a start-up error is readable.
+    status = 0
+    try: _, status = os.waitpid(pid, 0)
     except Exception: pass
+    if os.WIFSIGNALED(status): sys.exit(128 + os.WTERMSIG(status))
+    sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 0)
 
 if __name__ == "__main__":
     main()
