@@ -49,6 +49,19 @@ tmux SERVER  (one per machine)
   detached, and it applies only when you launch from a **new terminal** — from inside tmux a
   command in a pane cannot tell tmux which terminal typed it, and guessing wrong detaches the
   wrong person. `TCLAUDE_EVICT_VIEWERS=1` makes it the default.
+- **`--restart [--yes]`** — restarts the tmux server, so the next launch runs the tmux that is
+  installed now (a running server keeps the binary it started with). It first appends every
+  window to `~/.local/state/t-claude/restart.txt`, each t-claude one with the line that
+  resumes its conversation (`cd <folder> && t-claude [SESSION] --resume <id>`); if that file
+  cannot be written, nothing stops. Then it stops the server, and every window closes. Unlike a
+  bare `tmux kill-server` it waits until the server is really gone, and SIGKILLs clients stuck
+  writing to a dead terminal (an old SSH or EternalTerminal session), which otherwise hold the
+  exiting server for ~10s and then stay blocked forever. A server that does not answer is
+  given 25s to finish exiting; one that is live but refuses this tmux client (a client older
+  than the server does that) is reported, and stopped only on a yes. From inside tmux, tmux
+  shows `[server exited]`; run `t-claude` again. Any launch that finds a server mid-exit waits
+  for it rather than failing with `server exited unexpectedly`. A restored window is keyed by
+  its conversation id, so resume it with the same line rather than a plain `t-claude`.
 - If a folder's window already exists in a **different** session, t-claude *moves* it to
   the session you asked for, live, without killing Claude.
 - Only windows t-claude created carry `@tclaude_key`, so your **manual windows are never**
@@ -133,6 +146,7 @@ cd ~/mobile-app   && t-claude Apps                 # + window mobile-app (same s
 cd ~/api-gateway  && t-claude Backend              # session Backend, window api-gateway
 cd ~/web-frontend && t-claude Apps --resume conv7  # 2nd window "web-frontend-conv7"
 cd ~/fb4a         && t-claude --resume fb4a        # window (and tab) just "fb4a"
+t-claude --restart                                 # new tmux build: restart the server
 ```
 
 ## License

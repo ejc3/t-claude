@@ -1,5 +1,6 @@
 # t-claude [SESSION] [--resume <id> | --session-id <uuid>] [--title <label>] [--take-window]
 #          [CLAUDE_ARGS...]
+# t-claude --restart [--yes]   restart the tmux server onto the installed tmux (see RESTART)
 #
 # Anything t-claude does not itself recognise is passed straight through to the `claude`
 # invocation, unmodified and in order -- e.g. `t-claude --remote-control` or
@@ -692,6 +693,295 @@ _tclaude_prepare_inference_window() {
   return 0
 }
 
+# RESTART. `t-claude --restart [--yes]` stops the tmux server t-claude uses, so the next launch
+# starts a new one on the tmux it resolves now: a running server keeps the binary it started
+# with, so a new tmux-scroll build reaches a session only through a new server.
+#
+# Why this is more than `tmux kill-server` (measured 2026-09-28 against tmux next-3.8/3.9):
+#   - kill-server is the server SIGTERMing itself. The exiting server then lives on until its
+#     client list is empty, and closes every NEW connection meanwhile, so a launch run in that
+#     window fails with "server exited unexpectedly" / "could not create a window".
+#   - A client whose terminal nobody reads (a dead EternalTerminal or SSH session) blocks in
+#     its tty write. tmux drops it from the server after 10s (its per-client exit timer), so
+#     the window is ~10-20s -- but the client process stays blocked forever, and SIGTERM does
+#     not free it (the write restarts, the event loop is gone). Only SIGKILL does. A terminal
+#     that is merely slow (under ~2.5KB/s) looks the same after 5s and is killed too.
+#   - The same "server exited unexpectedly" is what a tmux client too old for a LIVE server
+#     prints. So that text alone never means "exiting": only the server going away does.
+# The stop sends the SIGTERM itself (no socket connection, and it hits the server that was
+# recorded, not whatever is on the socket by then), waits 5s, SIGKILLs that server's clients
+# still alive (found from its socket peers too, which list-clients misses for detached ones),
+# then the server itself, then its clients left blocked, and appends READY once it is gone. It
+# runs in its own session (setsid), so it finishes even when it was run from inside the
+# server it stops. Before anything stops, every window is recorded -- a t-claude window with
+# the line that resumes its conversation -- by APPENDING to
+# ${XDG_STATE_HOME:-~/.local/state}/t-claude/restart.txt; if that cannot be written, nothing
+# stops. Separately, every launch waits while a server on its socket is mid-exit instead of
+# failing, however that server was stopped.
+
+typeset -g _tclaude_exit_wait=25   # seconds to wait for a server that is exiting
+
+_tclaude_socket() {   # the socket plain `tmux` reaches from here
+  local sock="${TMUX:+${TMUX%%,*}}"
+  : "${sock:=${TMUX_TMPDIR:-/tmp}/tmux-$UID/default}"
+  print -r -- "${sock:A}"
+}
+
+_tclaude_socket_listener() {   # SOCKET -- pid listening on it, even while that server exits
+  local pid=""
+  if (( $+commands[ss] )); then
+    # The path is matched as " PATH " anywhere on the line, so a path with spaces still matches.
+    pid="$(ss -xlpH 2>/dev/null | S=" $1 " awk '$2 == "LISTEN" && index($0, ENVIRON["S"])' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+  elif (( $+commands[lsof] )); then
+    pid="$(lsof -t -- "$1" 2>/dev/null | head -1)"
+  fi
+  [[ "$pid" == <1-> ]] && print -r -- "$pid"
+}
+
+_tclaude_socket_clients() {   # SOCKET SERVER-PID -- pids at the far end of its connections
+  (( $+commands[ss] )) || return 0
+  # A server-side line is "u_str ESTAB q q PATH INODE * PEER users:((...,pid=N,...))"; the
+  # client's own line has "*" for its path and PEER as its inode.
+  ss -xpH 2>/dev/null | S=" $1 " P="pid=$2," awk '
+    $2 == "ESTAB" && index($0, ENVIRON["S"]) && index($0, ENVIRON["P"]) {
+      split(substr($0, index($0, ENVIRON["S"]) + length(ENVIRON["S"])), f, " ")
+      peer[f[3]] = 1; next
+    }
+    $2 == "ESTAB" && $5 == "*" { line[$6] = $0 }
+    END { for (i in peer) if ((i in line) && match(line[i], /pid=[0-9]+/)) print substr(line[i], RSTART + 4, RLENGTH - 4) }'
+}
+
+_tclaude_server_pid_query() {   # the server's pid, or tmux's error: bounded, even for a wedged server
+  # To a file, not $(...): the tmux client hands its stdout to the server with the request, so
+  # a stopped server keeps a pipe open after timeout(1) kills the client and $(...) never ends.
+  local f out
+  f="$(mktemp "${TMPDIR:-/tmp}/tclaude-q.XXXXXX" 2>/dev/null)" || { tmux display-message -p '#{pid}' 2>&1; return; }
+  if (( $+commands[timeout] )); then timeout 5 tmux display-message -p '#{pid}' >"$f" 2>&1 </dev/null
+  else tmux display-message -p '#{pid}' >"$f" 2>&1 </dev/null; fi
+  out="$(<"$f")"
+  rm -f "$f"
+  print -r -- "$out"
+}
+
+_tclaude_unreachable_hint() {   # why a server that is not exiting does not answer this client
+  local sock pid exe why
+  sock="$(_tclaude_socket)"
+  pid="$(_tclaude_socket_listener "$sock")"
+  [[ -n "$pid" ]] && exe="$(readlink "/proc/$pid/exe" 2>/dev/null || ps -o comm= -p "$pid" 2>/dev/null)"
+  if [[ -n "$pid" && "$(ps -o stat= -p "$pid" 2>/dev/null)" == T* ]]; then
+    why="It is stopped (SIGSTOP); kill -CONT $pid resumes it, or t-claude --restart --yes stops it."
+  elif [[ -n "$exe" && "$exe" == "${commands[tmux]:A}" ]]; then
+    why="It runs this same tmux, so it is wedged or overloaded; t-claude --restart stops it."
+  else
+    why="A client older than the server does that: put the server's tmux first (TCLAUDE_TMUX), or stop the server with t-claude --restart."
+  fi
+  print -u2 -r -- "t-claude: the tmux server on $sock${pid:+ (pid $pid${exe:+, running $exe})} is not exiting, but it does not answer this tmux client (${commands[tmux]:A}: $(tmux -V 2>/dev/null)). $why"
+}
+
+_tclaude_await_server_exit() {   # 0 once no server on our socket is mid-exit
+  local n=0
+  [[ "$(tmux display-message -p x 2>&1)" == *'server exited unexpectedly'* ]] || return 0
+  print -u2 -r -- "t-claude: the tmux server does not answer; waiting up to ${_tclaude_exit_wait}s in case it is exiting"
+  while (( n++ < _tclaude_exit_wait * 5 )); do
+    sleep 0.2
+    [[ "$(tmux display-message -p x 2>&1)" == *'server exited unexpectedly'* ]] || return 0
+  done
+  _tclaude_unreachable_hint
+  return 1
+}
+
+_tclaude_live_session_id() {   # PANE-PID -- the conversation id of a claude running under it
+  # @tclaude_resume is blank after a plain re-attach until claude's next prompt; claude's own
+  # per-process record (<config>/sessions/<pid>.json) has the live id.
+  local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" p id table n=0
+  local -a todo; todo=("$1")
+  table="$(ps -eo pid=,ppid= 2>/dev/null)"
+  while (( ${#todo} && n++ < 200 )); do
+    p="${todo[1]}"; shift todo
+    if [[ -r "$dir/$p.json" ]]; then
+      id="$(LC_ALL=C grep -aoE '"sessionId" *: *"[0-9a-fA-F-]{36}"' "$dir/$p.json" | head -1 | grep -oE '[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')"
+      _tclaude_is_uuid "$id" && { print -r -- "$id"; return 0; }
+    fi
+    todo+=(${(f)"$(print -r -- "$table" | awk -v pp="$p" '$2 == pp {print $1}')"})
+  done
+  return 1
+}
+
+_tclaude_window_field() { tmux -u display-message -p -t "$1" "$2" 2>/dev/null; }   # WINDOW FORMAT
+
+_tclaude_restart_listing() {   # the server's windows, each t-claude one with its resume line
+  local ids line wid sess key tpath rid agent ppath wname ppid where pass
+  # One window per line, fields fetched one by one: a folder name may hold a tab or newline,
+  # and without a UTF-8 locale tmux turns tabs in -F output into "_" (-u prevents that).
+  ids="$(tmux -u list-windows -a -F '#{window_id} #{session_name}' 2>/dev/null)" || return 1
+  typeset -A seen
+  # Home sessions first; a window that only a view still shows is recorded under the view's
+  # home session (a view is named <session>__tcv__<digits>).
+  for pass in home view; do
+    for line in "${(@f)ids}"; do
+      [[ -n "$line" ]] || continue
+      wid="${line%% *}" sess="${line#* }"
+      if [[ "$sess" == *__tcv__<-> || "$sess" == cmux-view-* ]]; then
+        [[ "$pass" == view ]] || continue
+        sess="${sess%__tcv__<->}"
+      else
+        [[ "$pass" == home ]] || continue
+      fi
+      [[ -n "${seen[$wid]-}" ]] && continue
+      seen[$wid]=1
+      key="$(_tclaude_window_field "$wid" '#{@tclaude_key}')"
+      tpath="$(_tclaude_window_field "$wid" '#{@tclaude_path}')"
+      rid="$(_tclaude_window_field "$wid" '#{@tclaude_resume}')"
+      agent="$(_tclaude_window_field "$wid" '#{@tclaude_agent}')"
+      ppath="$(_tclaude_window_field "$wid" '#{pane_current_path}')"
+      wname="$(_tclaude_window_field "$wid" '#{window_name}')"
+      ppid="$(_tclaude_window_field "$wid" '#{pane_pid}')"
+      where="${tpath:-$ppath}"
+      if [[ -z "$key" ]]; then
+        print -r -- "  # ${(q+)wname} in ${(q+)ppath}: not a t-claude window"
+      elif [[ "${agent:-claude}" != claude ]]; then
+        print -r -- "  # ${(q+)wname} in ${(q+)where}: runs $agent, relaunch it the way you started it"
+      else
+        _tclaude_is_uuid "$rid" || rid="$(_tclaude_live_session_id "$ppid")"
+        if _tclaude_is_uuid "$rid"; then
+          print -r -- "  cd ${(q+)where} && t-claude${${sess:#main}:+ ${(q+)sess}} --resume $rid"
+        else
+          print -r -- "  cd ${(q+)where} && t-claude${${sess:#main}:+ ${(q+)sess}}   # no conversation id found"
+        fi
+      fi
+    done
+  done
+}
+
+_tclaude_restart_stop() {   # SOCKET SERVER-PID RECORD [CLIENT-PID...] -- run detached
+  local sock="$1" spid="$2" rec="$3" p i
+  shift 3
+  local -a clients; clients=("$@")
+  _tclaude_restart_gone() { ! kill -0 "$spid" 2>/dev/null; }
+  _tclaude_restart_wait() { for i in {1..$1}; do _tclaude_restart_gone && return 0; sleep 0.1; done; _tclaude_restart_gone; }
+  _tclaude_restart_reap() {   # the listed clients still running: stuck, useless without the server
+    for p in ${(u)clients}; do
+      # A zombie is already dead, awaiting its parent.
+      [[ "$(ps -o stat= -p "$p" 2>/dev/null)" == [^Z]* ]] || continue
+      [[ "$(ps -o comm= -p "$p" 2>/dev/null)" == tmux* ]] || continue
+      kill -KILL "$p" 2>/dev/null && print -r -- "$(date +%T) killed stuck client $p of server $spid" >> "$rec"
+    done
+  }
+  _tclaude_restart_gone || kill -TERM "$spid" 2>/dev/null   # what kill-server does, without a connection
+  if ! _tclaude_restart_wait 50; then
+    clients+=($(_tclaude_socket_clients "$sock" "$spid"))
+    _tclaude_restart_reap
+    _tclaude_restart_wait 50 || {
+      ! _tclaude_restart_gone && kill -KILL "$spid" 2>/dev/null && print -r -- "$(date +%T) killed server $spid" >> "$rec"
+      _tclaude_restart_wait 30
+    }
+  fi
+  sleep 0.5   # a healthy client is gone by now; one still here is blocked in its tty write
+  _tclaude_restart_reap
+  if _tclaude_restart_gone; then
+    grep -q " READY: server $spid " "$rec" 2>/dev/null ||
+      print -r -- "$(date +%T) READY: server $spid is gone; the next t-claude starts a new one" >> "$rec"
+  else
+    print -r -- "$(date +%T) FAILED: server $spid is still running" >> "$rec"
+  fi
+}
+
+_tclaude_restart() {   # [--yes]
+  local yes=0 a
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) yes=1 ;;
+      *) print -u2 -r -- "t-claude --restart: unknown argument '$a' (it takes only --yes)"; return 2 ;;
+    esac
+  done
+  local sock next spid out rec listing head n i
+  local state="${XDG_STATE_HOME:-$HOME/.local/state}/t-claude"
+  local -a clients
+  sock="$(_tclaude_socket)"
+  next="${commands[tmux]:A}"
+  rec="$state/restart.txt"
+  if ! mkdir -p "$state" 2>/dev/null || ! { : >> "$rec"; } 2>/dev/null; then
+    print -u2 -r -- "t-claude --restart: cannot write $rec, where the windows are recorded; nothing stopped"
+    return 1
+  fi
+  # Bounded: a wedged server must not hang this before anything is recorded.
+  out="$(_tclaude_server_pid_query)"
+
+  if [[ "$out" != <1-> ]]; then
+    spid="$(_tclaude_socket_listener "$sock")"
+    if [[ -z "$spid" ]]; then
+      print -r -- "t-claude: no tmux server on $sock; the next launch starts one on $next"
+      return 0
+    fi
+    # Something listens but does not answer: a server exiting (it is gone within ~10-20s),
+    # or a live one this client cannot talk to. Only waiting tells them apart.
+    clients=($(_tclaude_socket_clients "$sock" "$spid"))
+    print -r -- "t-claude: the tmux server on $sock (pid $spid) does not answer this client (${out:-no reply}); waiting up to ${_tclaude_exit_wait}s in case it is exiting"
+    n=0
+    while kill -0 "$spid" 2>/dev/null && (( n++ < _tclaude_exit_wait * 5 )); do sleep 0.2; done
+    if ! kill -0 "$spid" 2>/dev/null; then
+      print -rl -- "" "t-claude --restart $(date '+%F %T') on ${HOST:-$(hostname)}: server $spid was already exiting" >> "$rec"
+      _tclaude_restart_stop "$sock" "$spid" "$rec" "${clients[@]}"   # reaps its stuck clients
+      grep -E " (killed stuck client [0-9]+ of server $spid|READY: server $spid |FAILED: server $spid )" "$rec"
+      print -r -- "t-claude: it has exited; the next launch starts a new server on $next"
+      return 0
+    fi
+    _tclaude_unreachable_hint
+    print -r -- "Its windows cannot be listed from this client, so none would be recorded."
+    if (( ! yes )); then
+      [[ -t 0 ]] || { print -u2 -r -- "t-claude --restart: not a terminal; pass --yes to stop it anyway"; return 1; }
+      read -q "?Stop it anyway (pid $spid)? Every window in it closes, unrecorded. [y/N] " || { print; print -r -- "Nothing stopped."; return 1; }
+      print
+    fi
+    head="t-claude --restart $(date '+%F %T') on ${HOST:-$(hostname)}: server $spid did not answer; its windows were not recorded"
+    { print -rl -- "" "$head" >> "$rec"; } 2>/dev/null || { print -u2 -r -- "t-claude --restart: cannot write $rec; nothing stopped"; return 1; }
+  else
+    spid="$out"
+    listing="$(_tclaude_restart_listing)" || { print -u2 -r -- "t-claude --restart: tmux could not list the server's windows; nothing stopped"; return 1; }
+    head="t-claude --restart $(date '+%F %T') on ${HOST:-$(hostname)}
+server pid $spid runs: ${$(readlink "/proc/$spid/exe" 2>/dev/null):-$(ps -o comm= -p "$spid" 2>/dev/null)}
+the next server runs: $next
+Windows, and the line that resumes each t-claude conversation:"
+    print -rl -- "$head" "$listing" ""
+    if (( ! yes )); then
+      [[ -t 0 ]] || { print -u2 -r -- "t-claude --restart: not a terminal; pass --yes to stop the server"; return 1; }
+      read -q "?Stop the tmux server (pid $spid)? Every window above closes. [y/N] " || { print; print -r -- "Nothing stopped."; return 1; }
+      print
+      # The answer can come much later: stop only the server that was listed, and record the
+      # windows it has now (one may have opened meanwhile).
+      if [[ "$(_tclaude_server_pid_query)" != "$spid" ]]; then
+        print -u2 -r -- "t-claude --restart: the server changed while waiting; nothing stopped"
+        return 1
+      fi
+      listing="$(_tclaude_restart_listing)" || { print -u2 -r -- "t-claude --restart: tmux could not list the server's windows; nothing stopped"; return 1; }
+    fi
+    # Appended, never truncated: an earlier run's lines may be the only copy of its windows.
+    { print -rl -- "" "$head" "$listing" >> "$rec"; } 2>/dev/null || { print -u2 -r -- "t-claude --restart: cannot write $rec; nothing stopped"; return 1; }
+    clients=($(tmux list-clients -F '#{client_pid}' 2>/dev/null))
+  fi
+
+  clients+=($(_tclaude_socket_clients "$sock" "$spid"))
+  local job="$(functions _tclaude_socket_clients _tclaude_restart_stop); _tclaude_restart_stop ${(q)sock} $spid ${(q)rec} ${clients[*]}"
+  if (( $+commands[setsid] )); then
+    setsid -f zsh -fc "$job" </dev/null >/dev/null 2>&1
+  else
+    nohup zsh -fc "$job" </dev/null >/dev/null 2>&1 &!
+  fi
+  if [[ -n "${TMUX-}" ]]; then
+    print -r -- "Stopping it. tmux shows [server exited] here in a moment; then run t-claude again (it waits if the old server is still going). The windows are in $rec."
+    return 0
+  fi
+  n=0
+  while (( n++ < 250 )); do
+    grep -qE " (READY|FAILED): server $spid " "$rec" 2>/dev/null && break
+    sleep 0.1
+  done
+  grep -E " (killed stuck client [0-9]+ of server $spid|killed server $spid|READY: server $spid |FAILED: server $spid )" "$rec"
+  grep -q " READY: server $spid " "$rec" 2>/dev/null || { print -r -- "t-claude --restart: still stopping; see $rec"; return 1; }
+  [[ -n "$listing" ]] && print -r -- "The windows and their resume lines are in $rec."
+  return 0
+}
+
 t-claude() {
   emulate -L zsh
   local IFS=$' \t\n\0'
@@ -711,6 +1001,14 @@ t-claude() {
   fi
   # Prefer a patched tmux (scroll-passthrough/scroll-replay) if one is installed.
   _tclaude_use_patched_tmux
+
+  # --restart is its own command: nothing below applies to it.
+  if (( ${argv[(Ie)--restart]} )); then
+    _tclaude_restart "${(@)argv:#--restart}"
+    return
+  fi
+  # A server mid-exit on our socket closes every new connection: wait for it to go.
+  _tclaude_await_server_exit || return 1
 
   local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0 take_window=0
   local agent_cmd="${TCLAUDE_AGENT_CMD-}" agent_label="${TCLAUDE_AGENT_LABEL:-claude}"
