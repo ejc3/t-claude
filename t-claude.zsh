@@ -426,6 +426,11 @@ _tclaude_mint_view() {
   # applied to the real session doesn't reach the view -- without this, a host with no
   # ~/.tmux.conf shows tmux's default green status bar in every t-claude terminal.
   tmux set-option -t "$view" status off 2>/dev/null
+  # Same for mouse: the real session's mouse off does not reach the view, and tmux next-3.8+
+  # defaults mouse ON. With it on, the phone's swipes and taps go to tmux as mouse events
+  # (copy mode, pane clicks) instead of scrolling the terminal's own scrollback, as they do
+  # with claude running outside tmux.
+  tmux set-option -t "$view" mouse off 2>/dev/null
   # Carry the tab label out to the enclosing terminal: the attached client's title becomes
   # the window name (the --title label when one was given), so the cmux/ghostty window is
   # named after the claude session it is showing.
