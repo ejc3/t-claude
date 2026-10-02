@@ -147,7 +147,15 @@ cd ~/api-gateway  && t-claude Backend              # session Backend, window api
 cd ~/web-frontend && t-claude Apps --resume conv7  # 2nd window "web-frontend-conv7"
 cd ~/fb4a         && t-claude --resume fb4a        # window (and tab) just "fb4a"
 t-claude --restart                                 # new tmux build: restart the server
+ANTHROPIC_MODEL=claude-sonnet-4-6 t-claude         # this window's Claude uses that model
 ```
+
+Claude runs in a tmux pane, which has the tmux server's environment rather than your shell's.
+So t-claude carries Claude's model variables across itself: `ANTHROPIC_MODEL`,
+`ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+`ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL`.
+The window keeps them when it relaunches after Claude exits. Set one again to change them, or
+set it empty to clear them. A Claude that is already running is attached, not restarted.
 
 ## License
 

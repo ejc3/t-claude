@@ -101,6 +101,11 @@
 #                   /clear, /branch and /cd); a different launch reusing the window, or
 #                   --agent-cmd taking it over, starts without them and clears them.
 #                   Cannot combine with --agent-label.
+#   Model variables : ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL,
+#                   ANTHROPIC_SMALL_FAST_MODEL and CLAUDE_CODE_SUBAGENT_MODEL set for t-claude
+#                   reach the claude it launches (the pane has the tmux server's environment,
+#                   not yours). The window keeps them for its relaunches; setting any of them
+#                   again replaces them, empty clears them. Not added to --agent-cmd.
 #   A window whose agent has EXITED is reused by the next launch in that folder, whatever
 #   agent the launch is for (found by @tclaude_path once the exact key lookup misses); a
 #   window with a live agent is never reused.
@@ -648,6 +653,36 @@ _tclaude_inference_command() {
   print -r -- "${(j: :)${(@q)args}}"
 }
 
+# Claude's model settings that live in its ENVIRONMENT. Claude runs in a tmux pane, whose shell
+# has the tmux server's environment, not the caller's: `ANTHROPIC_MODEL=x t-claude` reached
+# t-claude and stopped there (a bare `claude` got it). They are carried into the launch as
+# assignments on the claude command itself -- never exported into the pane's shell, so a later
+# launch typed there does not inherit them -- and saved with the window, like inference profiles.
+typeset -ga _tclaude_model_vars
+_tclaude_model_vars=(ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+  ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL)
+
+# NAME=VALUE... -> the assignments to put before the claude command ("" for none). Each NAME is
+# one of _tclaude_model_vars and each VALUE a model name (letters, digits and ._:/@+[]-, at
+# most 200), checked here for the caller's values and again for a window's saved ones.
+_tclaude_model_env_prefix() {
+  emulate -L zsh
+  local a name value out=""
+  for a in "$@"; do
+    name="${a%%=*}" value="${a#*=}"
+    if [[ "$a" != *=* ]] || (( ! ${_tclaude_model_vars[(Ie)$name]} )); then
+      print -u2 -r -- "t-claude: not a model setting: $name"
+      return 1
+    fi
+    if [[ -z "$value" || ${#value} -gt 200 || "$value" == *[^A-Za-z0-9._:/@+\[\]-]* ]]; then
+      print -u2 -r -- "t-claude: invalid $name (a model name: letters, digits and ._:/@+[]-)"
+      return 1
+    fi
+    out+="$name=${(q)value} "
+  done
+  print -r -- "$out"
+}
+
 _tclaude_launch_line() {
   emulate -L zsh
   local folder="$1" inner="$2"
@@ -665,7 +700,29 @@ _tclaude_launch_line() {
 # fails in the pane (command not found keeps the window open) -- it is looked up where it
 # runs, not in the caller's environment. --agent-cmd taking the window over clears it.
 _tclaude_prepare_inference_window() {
-  local target="$1" saved
+  local target="$1" saved saved_env rebuild=0
+  # The window's model settings (see _tclaude_model_vars), in their own option: any of the
+  # variables set by the caller (even empty) replaces them, none set relaunches with them, and
+  # --agent-cmd taking the window over clears them. They are written before anything is sent.
+  saved_env="$(tmux show-options -wqv -t "$target" @tclaude_model_env)" || return 1
+  if [ -n "$agent_cmd" ]; then
+    [ -z "$saved_env" ] || tmux set-option -wu -t "$target" @tclaude_model_env || return 1
+  elif (( model_env_requested )); then
+    if (( ${#model_settings} )); then
+      tmux set-option -w -t "$target" @tclaude_model_env "env-v1 ${model_settings[*]}" || return 1
+    elif [ -n "$saved_env" ]; then
+      tmux set-option -wu -t "$target" @tclaude_model_env || return 1
+    fi
+  elif [ -n "$saved_env" ]; then
+    local -a e; e=(${=saved_env})
+    if [ "${e[1]-}" != env-v1 ] || (( ${#e} < 2 )); then
+      print -u2 -r -- "t-claude: this window's saved model settings cannot be read; set ${_tclaude_model_vars[1]} (empty clears them) to replace them"
+      return 1
+    fi
+    model_settings=("${(@)e[2,-1]}")
+    model_env="$(_tclaude_model_env_prefix "${model_settings[@]}")" || return 1
+    rebuild=1
+  fi
   saved="$(tmux show-options -wqv -t "$target" @tclaude_inference)" || return 1
   if (( ! inference_requested )) && [[ -n "$saved" ]]; then
     local -a w; w=(${=saved})
@@ -687,7 +744,10 @@ _tclaude_prepare_inference_window() {
     inference_model="${w[2]}"
     inference_profiles=("${(@)w[3,-1]}")
     inference_command="$(_tclaude_inference_command "$inference_model" "${inference_profiles[@]}")" || return 1
-    inner="${altscreen}${wrap}${inference_command}${native_args}"
+    rebuild=1
+  fi
+  if (( rebuild )); then
+    inner="${altscreen}${model_env}${wrap}${inference_command}${native_args}"
     cmd="$(_tclaude_launch_line "$folder" "$inner")"
   fi
   if (( ${#inference_profiles} )); then
@@ -1140,6 +1200,18 @@ t-claude() {
     inference_command="$(_tclaude_inference_command "$inference_model" "${inference_profiles[@]}")" || return 1
   fi
 
+  # Claude's model variables from this shell (_tclaude_model_vars): the pane would not get them
+  # otherwise. Any of them set, even empty, replaces what the window saved; empty ones are left
+  # out. They go on the claude command, not into --agent-cmd (a whole command, given as is).
+  local model_env="" model_env_requested=0 mv
+  local -a model_settings
+  for mv in "${_tclaude_model_vars[@]}"; do
+    [[ -v $mv ]] || continue
+    model_env_requested=1
+    [ -n "${(P)mv}" ] && model_settings+=("$mv=${(P)mv}")
+  done
+  model_env="$(_tclaude_model_env_prefix "${model_settings[@]}")" || return 1
+
   # One id drives the window key and title: --resume wins if both were given. They differ only
   # in which flag the inner claude gets, so a first run under --session-id and every later run
   # under --resume with the same id share one window.
@@ -1412,7 +1484,7 @@ HOOKSJSON
   elif (( ${#_hist} )); then native_args=" --resume $flags$hooks_flag$extra"
   else native_args=" $flags$hooks_flag$extra"; fi
   if [ -n "$agent_cmd" ]; then inner="$agent_cmd"
-  else inner="${altscreen}${wrap}${inference_command}${native_args}"; fi
+  else inner="${altscreen}${model_env}${wrap}${inference_command}${native_args}"; fi
 
   # Ctrl-Z NOTE: the window runs your interactive shell and claude is sent to it as a JOB, so
   # Ctrl-Z suspends it and `fg` resumes (a pane command is a session leader whose orphaned group
@@ -1483,9 +1555,10 @@ HOOKSJSON
     if [ -n "$here_home" ] && [ "$here_home" = "$session" ]; then
       win="$here"
       adopted=1
-      # A pane that ran ANOTHER conversation's agent: its saved inference is that agent's.
+      # A pane that ran ANOTHER conversation's agent: its saved inference and model are that
+      # agent's.
       [ "$(tmux show-options -wqv -t "$win" @tclaude_key 2>/dev/null)" = "$key" ] ||
-        tmux set-option -wu -t "$win" @tclaude_inference 2>/dev/null
+        { tmux set-option -wu -t "$win" @tclaude_inference; tmux set-option -wu -t "$win" @tclaude_model_env; } 2>/dev/null
       tmux set-option -w -t "$win" @tclaude_key "$key" 2>/dev/null
       [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
       # This pane's own shell runs the line once t-claude returns: nothing to wait for.
@@ -1543,8 +1616,10 @@ HOOKSJSON
       _tclaude_shell_at_prompt "$ewin" "$epid" || continue
       win="$ewin"
       tmux set-option -w -t "$win" @tclaude_key "$key" 2>/dev/null
-      # Re-keyed for this launch: the exited agent's saved inference was that agent's, not this.
+      # Re-keyed for this launch: the exited agent's saved inference and model were that
+      # agent's, not this one's.
       tmux set-option -wu -t "$win" @tclaude_inference 2>/dev/null
+      tmux set-option -wu -t "$win" @tclaude_model_env 2>/dev/null
       [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
       printf "reusing this folder's window -- its %s had exited\n" "${elabel:-claude}" >&2
       break
@@ -1639,6 +1714,9 @@ HOOKSJSON
         fi
       elif (( inference_requested )); then
         print -u2 -r -- 't-claude: attaching to the running window; inference profiles/model were not changed. Exit Claude first, then run this command again to change them.'
+      elif (( model_env_requested )) &&
+           [ "$(tmux show-options -wqv -t "$win" @tclaude_model_env 2>/dev/null)" != "${model_settings:+env-v1 ${model_settings[*]}}" ]; then
+        print -u2 -r -- "t-claude: attaching to the running window; its model was not changed (${model_settings[*]:-default}). Exit Claude first, then run this command again to change it."
       fi
     fi
   fi
