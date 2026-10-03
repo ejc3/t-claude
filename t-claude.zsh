@@ -1354,10 +1354,12 @@ fi
 # /branch reaches here with source=fork in a live pane (the only path that does). At fork time
 # claude is still in the checkout the branch was spawned from -- cwd is that source tree. Hand
 # off to an optional host-local extension: TC_CWD is the source checkout to derive from, TC_SID
-# the new branch id, TC_PANE the pane to drive. t-claude names no workflow of its own.
+# the new branch id, TC_PANE the pane to drive. TC_PREV_SID is the id this window showed until
+# now, read before the re-stamp above replaced it: the pane has become the branch, and nothing
+# else still knows which conversation it left. t-claude names no workflow of its own.
 if [ "$src" = "fork" ] && [ "$managed" = 1 ]; then
   bh="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/branch-hook"
-  [ -x "$bh" ] && TC_PANE="$TMUX_PANE" TC_SID="$sid" TC_CWD="${cwd:-$npath}" "$bh" >/dev/null 2>&1
+  [ -x "$bh" ] && TC_PANE="$TMUX_PANE" TC_SID="$sid" TC_CWD="${cwd:-$npath}" TC_PREV_SID="$rid" "$bh" >/dev/null 2>&1
 fi
 exit 0
 SSYNC
