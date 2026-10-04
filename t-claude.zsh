@@ -1924,6 +1924,13 @@ RSETTLE
   for hpat in 'xterm*' 'tmux*' 'alacritty*' 'foot*'; do
     (( ${${(f)tfeat}[(Ie)${hpat}:hyperlinks]} )) || tmux set-option -sa terminal-features ",${hpat}:hyperlinks" 2>/dev/null
   done
+  # Keys the way the terminal sends them. With extended-keys on, tmux takes part in the kitty
+  # keyboard protocol (and xterm's modifyOtherKeys): it answers claude asking for it and asks
+  # the terminal for it, so Ctrl+Enter is not Enter, Ctrl+I is not Tab and Escape needs no
+  # wait. tmux's default is off, where it acts as a terminal without them. A SERVER option,
+  # applied to a client when it attaches; left alone unless off, so a user's `always` stays.
+  [ "$(tmux show-options -sv extended-keys 2>/dev/null)" = off ] &&
+    tmux set-option -s extended-keys on 2>/dev/null
 
   } always {
     _tclaude_launch_unlock

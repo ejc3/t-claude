@@ -42,6 +42,12 @@ tmux SERVER  (one per machine)
   patched tmux reports `next-3.8`, which fails Claude's tmux ≥ 3.4 check). A terminal already
   attached picks the feature up on its next attach. `export FORCE_HYPERLINK=0` in the pane's
   shell (e.g. `~/.zshrc`) turns links off.
+- **Keys** — t-claude turns tmux's `extended-keys` on (tmux's default is off), so Claude
+  gets keys as the terminal sends them: Ctrl+Enter is not Enter, Ctrl+I is not Tab, and
+  Escape needs no wait. With a tmux that has the kitty keyboard protocol, that is the
+  protocol, as in kitty itself. It is a server option, so it applies to every session on the
+  server; a value other than `off` (such as your own `always`) is left alone. A terminal
+  already attached gets it on its next attach.
 - **`--take-window`** — detaches every other terminal parked on the window before showing it.
   **Off by default**; sharing is what t-claude has always done. Useful when a window has
   several viewers: a tmux window has one grid, so the extra ones render at someone else's size
