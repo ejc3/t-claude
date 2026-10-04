@@ -9,6 +9,10 @@ source "$local_repo/t-claude.zsh" || exit 1
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/tclaude-hyperlink-tests.XXXXXXXX")" || exit 1
 export XDG_CACHE_HOME="$test_root/cache" CLAUDE_CONFIG_DIR="$test_root/claude" TMUX_TMPDIR="$test_root/tmux-tmp"
 unset TMUX TMUX_PANE TCLAUDE_ARGS TCLAUDE_AGENT_CMD TCLAUDE_AGENT_LABEL FORCE_HYPERLINK TERM_PROGRAM_VERSION
+# The caller's model settings would be carried into every launch here (tests/model-env.zsh
+# is where they are tested).
+unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL
 mkdir -p "$test_root/project"
 cd "$test_root/project" || exit 1
 test_checks=0

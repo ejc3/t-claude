@@ -13,6 +13,10 @@ else
 fi
 export HOME="$test_root/home" XDG_CACHE_HOME="$test_root/home/.cache" CLAUDE_CONFIG_DIR="$test_root/claude" TMUX_TMPDIR="$test_root/tmux-tmp"
 unset TMUX TMUX_PANE TCLAUDE_ARGS TCLAUDE_AGENT_CMD TCLAUDE_AGENT_LABEL
+# The caller's model settings would be carried into every launch here (tests/model-env.zsh
+# is where they are tested).
+unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL
 mkdir -p "$HOME" "$test_root/a project"
 cd "$test_root/a project" || exit 1
 test_checks=0

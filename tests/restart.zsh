@@ -19,6 +19,10 @@ test_root="$(mktemp -d /tmp/tcr.XXXXXX)" || exit 1
 export HOME="$test_root/h" XDG_CACHE_HOME="$test_root/h/.cache" XDG_STATE_HOME="$test_root/h/.state" \
   TMUX_TMPDIR="$test_root/t" CLAUDE_CONFIG_DIR="$test_root/claude"
 unset TMUX TMUX_PANE TCLAUDE_ARGS TCLAUDE_AGENT_CMD TCLAUDE_AGENT_LABEL
+# The caller's model settings would be carried into every launch here (tests/model-env.zsh
+# is where they are tested).
+unset ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL
 mkdir -p "$HOME" "$TMUX_TMPDIR" "$XDG_CACHE_HOME/t-claude/bin" "$CLAUDE_CONFIG_DIR/sessions" "$test_root/a project"
 ln -s "$real_tmux" "$XDG_CACHE_HOME/t-claude/bin/tmux"
 export PATH="$XDG_CACHE_HOME/t-claude/bin:$PATH"
