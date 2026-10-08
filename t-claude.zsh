@@ -101,6 +101,19 @@
 #                   /clear, /branch and /cd); a different launch reusing the window, or
 #                   --agent-cmd taking it over, starts without them and clears them.
 #                   Cannot combine with --agent-label.
+#   --inference-server <host:port> : use a SHARED claude-master server for inference
+#                   (`claude-master connect`): the server holds the subscription logins, this
+#                   box holds only a client certificate (--inference-dir, default the client
+#                   directory claude-master itself uses, ~/.config/claude-master). The
+#                   native login, tools, permissions, hooks, --continue and Remote Control stay
+#                   Claude's. TCLAUDE_INFERENCE_SERVER and TCLAUDE_INFERENCE_DIR in the
+#                   environment are the same two knobs, so an unattended launcher sets them
+#                   once; a flag overrides them. The window saves the server like it saves
+#                   profiles: a relaunch (across /clear, /branch and /cd) uses it again, and a
+#                   saved value that cannot be read fails the launch instead of starting a
+#                   plain claude. There is NO fallback to a login on this box: a server that
+#                   is down is reported, not worked around. Cannot combine with
+#                   --inference-profile, --agent-cmd or --agent-label.
 #   Model variables : ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL,
 #                   ANTHROPIC_SMALL_FAST_MODEL and CLAUDE_CODE_SUBAGENT_MODEL set for t-claude
 #                   reach the claude it launches (the pane has the tmux server's environment,
@@ -653,6 +666,26 @@ _tclaude_inference_command() {
   print -r -- "${(j: :)${(@q)args}}"
 }
 
+# The shared-server form: `claude-master connect --server HOST:PORT [--dir DIR] --`, then the native
+# arguments, exactly where `claude-master run PROFILE ... --` goes. Only an address and a path
+# (not credentials) are kept in the window's option; validate them again on a relaunch.
+_tclaude_inference_server_command() {
+  emulate -L zsh
+  local server="$1" dir="${2-}"
+  if [[ "$server" != [A-Za-z0-9]*:<1-65535> || "$server" == *[^A-Za-z0-9.:-]* ]] || (( ${#${server//[^:]/}} != 1 )); then
+    print -u2 -r -- 't-claude: invalid --inference-server (use host:port, letters, digits, dots and hyphens)'
+    return 1
+  fi
+  if [ -n "$dir" ] && { [[ "$dir" != /* ]] || [[ "$dir" == *[^A-Za-z0-9_./-]* ]] || [[ "$dir" == *..* ]]; }; then
+    print -u2 -r -- 't-claude: invalid --inference-dir (an absolute path of letters, digits, dots, hyphens and slashes)'
+    return 1
+  fi
+  local -a args; args=(claude-master connect --server "$server")
+  [ -z "$dir" ] || args+=(--dir "$dir")
+  args+=(--)
+  print -r -- "${(j: :)${(@q)args}}"
+}
+
 # Claude's model settings that live in its ENVIRONMENT. Claude runs in a tmux pane, whose shell
 # has the tmux server's environment, not the caller's: `ANTHROPIC_MODEL=x t-claude` reached
 # t-claude and stopped there (a bare `claude` got it). They are carried into the launch as
@@ -731,20 +764,35 @@ _tclaude_prepare_inference_window() {
       tmux set-option -wu -t "$target" @tclaude_inference || return 1
       return 0
     fi
+    # "server-v1 HOST:PORT DIR" (DIR is - when the client directory is the default): the shared-server form.
+    if [ "${w[1]-}" = server-v1 ]; then
+      if (( ${#w} != 3 )); then
+        print -u2 -r -- 't-claude: this window has a saved inference server that cannot be read; use explicit --inference-server to replace it'
+        return 1
+      fi
+      if [ "$agent_label" != claude ]; then
+        print -u2 -r -- 't-claude: this window has a saved inference server, which cannot run under --agent-label or TCLAUDE_AGENT_LABEL'
+        return 1
+      fi
+      inference_server="${w[2]}"; inference_dir="${w[3]}"; [ "$inference_dir" = - ] && inference_dir=""
+      inference_command="$(_tclaude_inference_server_command "$inference_server" "$inference_dir")" || return 1
+      rebuild=1
     # v2 = "profiles-v2 MODEL PROFILE..."; anything else (v1 carried a key before the model)
     # fails closed rather than being read with its fields shifted.
-    if [ "${w[1]-}" != profiles-v2 ] || (( ${#w} < 3 )); then
+    elif [ "${w[1]-}" != profiles-v2 ] || (( ${#w} < 3 )); then
       print -u2 -r -- 't-claude: this window has saved inference profiles; use explicit --inference-profile and --inference-model to replace incomplete or incompatible settings'
       return 1
     fi
-    if [ "$agent_label" != claude ]; then   # see the --agent-label check in t-claude
-      print -u2 -r -- 't-claude: this window has saved inference profiles, which cannot run under --agent-label or TCLAUDE_AGENT_LABEL'
-      return 1
+    if [ "${w[1]-}" != server-v1 ]; then
+      if [ "$agent_label" != claude ]; then   # see the --agent-label check in t-claude
+        print -u2 -r -- 't-claude: this window has saved inference profiles, which cannot run under --agent-label or TCLAUDE_AGENT_LABEL'
+        return 1
+      fi
+      inference_model="${w[2]}"
+      inference_profiles=("${(@)w[3,-1]}")
+      inference_command="$(_tclaude_inference_command "$inference_model" "${inference_profiles[@]}")" || return 1
+      rebuild=1
     fi
-    inference_model="${w[2]}"
-    inference_profiles=("${(@)w[3,-1]}")
-    inference_command="$(_tclaude_inference_command "$inference_model" "${inference_profiles[@]}")" || return 1
-    rebuild=1
   fi
   if (( rebuild )); then
     inner="${altscreen}${model_env}${wrap}${inference_command}${native_args}"
@@ -754,6 +802,8 @@ _tclaude_prepare_inference_window() {
     # ONE option, one write, under the launch lock: a failed write stops the launch and leaves
     # the previous value whole, and it always describes the command that then runs.
     tmux set-option -w -t "$target" @tclaude_inference "profiles-v2 $inference_model ${inference_profiles[*]}" || return 1
+  elif [ -n "$inference_server" ]; then
+    tmux set-option -w -t "$target" @tclaude_inference "server-v1 $inference_server ${inference_dir:--}" || return 1
   fi
   return 0
 }
@@ -1078,6 +1128,7 @@ t-claude() {
   local session="" resume="" sid="" title="" folder base cmd key winname win explicit=0 auto=0 take_window=0
   local agent_cmd="${TCLAUDE_AGENT_CMD-}" agent_label="${TCLAUDE_AGENT_LABEL:-claude}"
   local inference_model="" inference_command="claude" inference_requested=0
+  local inference_server="" inference_dir=""
   local -a passthrough inference_profiles
   # Canonical physical path (${PWD:A} resolves symlinks), NOT the logical $PWD. The window
   # identity is keyed off this, and $PWD is not stable for one directory: on many setups
@@ -1169,6 +1220,20 @@ t-claude() {
           print -u2 -r -- 't-claude: --inference-profile requires a profile name'; return 1
         fi
         inference_profiles+=("$2"); inference_requested=1; shift 2 ;;
+      --inference-server=*)
+        inference_server="${1#--inference-server=}"; inference_requested=1; shift ;;
+      --inference-server)
+        if [ -z "${2-}" ] || [[ "$2" == -* ]]; then
+          print -u2 -r -- 't-claude: --inference-server requires host:port'; return 1
+        fi
+        inference_server="$2"; inference_requested=1; shift 2 ;;
+      --inference-dir=*)
+        inference_dir="${1#--inference-dir=}"; shift ;;
+      --inference-dir)
+        if [ -z "${2-}" ] || [[ "$2" == -* ]]; then
+          print -u2 -r -- 't-claude: --inference-dir requires a directory'; return 1
+        fi
+        inference_dir="$2"; shift 2 ;;
       --inference-model=*)
         inference_model="${1#--inference-model=}"; inference_requested=1; shift ;;
       --inference-model)
@@ -1186,18 +1251,35 @@ t-claude() {
   # later launch in that terminal. zsh's dynamic scope carries it into the evict helper.
   if [ "$take_window" = 1 ]; then local TCLAUDE_EVICT_VIEWERS=1; fi
 
+  # The environment's server is the DEFAULT for a launch that asked for nothing else: an explicit
+  # flag, a profile launch or an agent command wins, so none of them is ever changed by it.
+  if (( ! inference_requested )) && [ -z "$agent_cmd" ] && [ "$agent_label" = claude ] && [ -n "${TCLAUDE_INFERENCE_SERVER-}" ]; then
+    inference_server="$TCLAUDE_INFERENCE_SERVER"; inference_dir="${TCLAUDE_INFERENCE_DIR-}"
+    inference_command="$(_tclaude_inference_server_command "$inference_server" "$inference_dir")" || return 1
+  fi
+  if [ -z "$inference_server" ] && [ -n "$inference_dir" ]; then
+    print -u2 -r -- 't-claude: --inference-dir needs --inference-server'; return 1
+  fi
   if (( inference_requested )); then
+    if [ -n "$inference_server" ] && { [ -n "$inference_model" ] || (( ${#inference_profiles} )); }; then
+      print -u2 -r -- 't-claude: --inference-server cannot be combined with --inference-profile or --inference-model'
+      return 1
+    fi
     if [ -n "$agent_cmd" ]; then
-      print -u2 -r -- 't-claude: --inference-profile cannot be combined with --agent-cmd or TCLAUDE_AGENT_CMD'
+      print -u2 -r -- 't-claude: --inference-profile and --inference-server cannot be combined with --agent-cmd or TCLAUDE_AGENT_CMD'
       return 1
     fi
     # The liveness check finds the agent by this label, and claude-master is found as claude:
     # under another label a running profile launch would look dead and get a second one.
     if [ "$agent_label" != claude ]; then
-      print -u2 -r -- 't-claude: --inference-profile cannot be combined with --agent-label or TCLAUDE_AGENT_LABEL'
+      print -u2 -r -- 't-claude: --inference-profile and --inference-server cannot be combined with --agent-label or TCLAUDE_AGENT_LABEL'
       return 1
     fi
-    inference_command="$(_tclaude_inference_command "$inference_model" "${inference_profiles[@]}")" || return 1
+    if [ -n "$inference_server" ]; then
+      inference_command="$(_tclaude_inference_server_command "$inference_server" "$inference_dir")" || return 1
+    else
+      inference_command="$(_tclaude_inference_command "$inference_model" "${inference_profiles[@]}")" || return 1
+    fi
   fi
 
   # Claude's model variables from this shell (_tclaude_model_vars): the pane would not get them
