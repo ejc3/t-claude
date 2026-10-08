@@ -173,7 +173,9 @@ check test -z "$test_typed"
 hold_lock() {
   rm -f "$test_root/held"
   zsh -fc 'zmodload zsh/system; zsystem flock -f fd "$1" && { : > "$2"; sleep "$3"; }' - "$lockfile" "$test_root/held" "$1" &
-  local n=0; until [[ -e "$test_root/held" ]] || (( n++ > 100 )); do sleep 0.02; done
+  # Wait (up to 10s) until the holder SAYS it has the lock; never carry on without that, or the call under test races it.
+  local n=0; until [[ -e "$test_root/held" ]] || (( n++ > 500 )); do sleep 0.02; done
+  [[ -e "$test_root/held" ]] || fail "the lock holder never took the lock"
 }
 reset_case
 test_exists=1
@@ -208,8 +210,12 @@ check test -z "$test_typed"
 # One lock per server whoever asks: through a symlinked TMUX_TMPDIR (macOS /tmp) it is the
 # same file as the resolved path $TMUX carries inside tmux.
 ln -s "$TMUX_TMPDIR" "$test_root/tmux-link"
+# The marker must be THIS holder's. It was left behind by the hold_lock calls above, so without this rm the wait below returned
+# at once, before the holder had the lock, and the call under test sometimes took the lock first ("two locks for one server").
+rm -f "$test_root/held"
 ( TMUX_TMPDIR="$test_root/tmux-link"; _tclaude_launch_lock && { : > "$test_root/held"; sleep 3; } ) &
-n=0; until [[ -e "$test_root/held" ]] || (( n++ > 100 )); do sleep 0.02; done
+n=0; until [[ -e "$test_root/held" ]] || (( n++ > 500 )); do sleep 0.02; done
+[[ -e "$test_root/held" ]] || fail "the first launch never took the lock"
 ( TMUX="${TMUX_TMPDIR:A}/tmux-$UID/default,1,0" _tclaude_lock_wait=1; _tclaude_launch_lock ) 2>/dev/null && fail 'two locks for one server'
 wait
 # A socket in a directory that is not ours alone (tmux -S /tmp/x) keeps its lock in our own
