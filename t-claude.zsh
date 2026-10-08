@@ -112,7 +112,9 @@
 #                   profiles: a relaunch (across /clear, /branch and /cd) uses it again, and a
 #                   saved value that cannot be read fails the launch instead of starting a
 #                   plain claude. There is NO fallback to a login on this box: a server that
-#                   is down is reported, not worked around. Cannot combine with
+#                   is down is reported, not worked around. TCLAUDE_CLAUDE_MASTER (an absolute path)
+#                   names which claude-master binary runs, for a box that carries more than one
+#                   (a personal build ahead of the shared one on PATH). Cannot combine with
 #                   --inference-profile, --agent-cmd or --agent-label.
 #   Model variables : ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL,
 #                   ANTHROPIC_SMALL_FAST_MODEL and CLAUDE_CODE_SUBAGENT_MODEL set for t-claude
@@ -682,7 +684,14 @@ _tclaude_inference_server_command() {
   fi
   # `connect` has no default client directory of its own. Without --inference-dir it is $HOME/.config/claude-master,
   # left for the shell that runs the line to expand: the pane's HOME, not the caller's.
-  local -a args; args=(claude-master connect --server "$server")
+  # Which claude-master: the one on PATH unless TCLAUDE_CLAUDE_MASTER names another by absolute path. A box can carry
+  # more than one build (a personal one ahead of the shared one on PATH); this pins the one that is meant for the server.
+  local bin="${TCLAUDE_CLAUDE_MASTER:-claude-master}"
+  if [[ "$bin" != claude-master ]] && { [[ "$bin" != /* ]] || [[ "$bin" == *[^A-Za-z0-9_./-]* ]] || [[ "$bin" == *..* ]]; }; then
+    print -u2 -r -- 't-claude: invalid TCLAUDE_CLAUDE_MASTER (claude-master, or an absolute path of letters, digits, dots, hyphens and slashes)'
+    return 1
+  fi
+  local -a args; args=("$bin" connect --server "$server")
   local line="${(j: :)${(@q)args}}"
   if [ -n "$dir" ]; then line+=" --dir ${(q)dir}"; else line+=' --dir "$HOME/.config/claude-master"'; fi
   print -r -- "$line --"

@@ -117,6 +117,31 @@ check test "${test_sent//$HOME\/.config/}" = "$test_sent"      # the caller's HO
 actual_args=("${(@f)$(<"$test_root/argv")}")
 check test "$actual_args[5]" = /home/pane-user/.config/claude-master
 
+# ---- which claude-master runs: PATH's by default, an absolute path when TCLAUDE_CLAUDE_MASTER names one
+reset_case
+export TCLAUDE_CLAUDE_MASTER=/usr/local/bin/claude-master
+check run_case --inference-server 203.0.113.5:8443 --remote-control
+check contains "$test_sent" 'nosync-wrap /usr/local/bin/claude-master connect --server 203.0.113.5:8443 --dir'
+# ...the saved window relaunches with the binary named NOW, and only the server mode uses it
+reset_case
+test_exists=1 test_meta='server-v1 saved.internal:8443 -'
+check run_case --resume conversation
+check contains "$test_sent" 'nosync-wrap /usr/local/bin/claude-master connect --server saved.internal:8443'
+reset_case
+check run_case --inference-profile first --inference-model claude-sonnet-4-6 --remote-control
+check contains "$test_sent" 'nosync-wrap claude-master run first'
+check test "${test_sent//\/usr\/local\/bin\/claude-master/}" = "$test_sent"
+for bad in relative/claude-master ./claude-master '/with space/claude-master' '/a/../b/claude-master' '/a;b/claude-master' '$(id)' '/x/$HOME/claude-master'; do
+  reset_case
+  export TCLAUDE_CLAUDE_MASTER="$bad"
+  run_case --inference-server 203.0.113.5:8443 && fail "accepted TCLAUDE_CLAUDE_MASTER=$bad"
+  check test -z "$test_sent"
+done
+unset TCLAUDE_CLAUDE_MASTER
+reset_case
+check run_case --inference-server 203.0.113.5:8443 --remote-control
+check contains "$test_sent" 'nosync-wrap claude-master connect --server 203.0.113.5:8443'
+
 # ---- a client directory, an auto launch (what an unattended launcher runs), and a name with a space
 reset_case
 check run_case --auto --remote-control --inference-server=pool.internal:8443 --inference-dir /home/example/.config/claude-master
