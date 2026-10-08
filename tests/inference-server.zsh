@@ -92,7 +92,7 @@ reject_case() {
 # ---- an explicit server: claude-master connect replaces claude, every other flag survives
 reset_case
 check run_case --inference-server 203.0.113.5:8443 --remote-control --resume conversation
-check contains "$test_sent" 'nosync-wrap claude-master connect --server 203.0.113.5:8443 -- --resume conversation'
+check contains "$test_sent" 'nosync-wrap claude-master connect --server 203.0.113.5:8443 --dir "$HOME/.config/claude-master" -- --resume conversation'
 check contains "$test_sent" '--settings'
 check contains "$test_sent" '--remote-control'
 check test "$test_meta" = 'server-v1 203.0.113.5:8443 -'
@@ -102,9 +102,20 @@ actual_args=("${(@f)$(<"$test_root/argv")}")
 check test "$actual_args[1]" = connect
 check test "$actual_args[2]" = --server
 check test "$actual_args[3]" = 203.0.113.5:8443
-check test "$actual_args[4]" = --
-check test "$actual_args[5]" = --resume
-check test "$actual_args[6]" = conversation
+check test "$actual_args[4]" = --dir
+check test "$actual_args[5]" = "$HOME/.config/claude-master"
+check test "$actual_args[6]" = --
+check test "$actual_args[7]" = --resume
+check test "$actual_args[8]" = conversation
+
+# ---- the default client directory is the HOME of the shell that RUNS the line, not of the one that built it
+reset_case
+check run_case --inference-server 203.0.113.5:8443 --remote-control
+check contains "$test_sent" '"$HOME/.config/claude-master"'
+check test "${test_sent//$HOME\/.config/}" = "$test_sent"      # the caller's HOME is not baked into the line
+(HOME=/home/pane-user; eval "$test_sent")
+actual_args=("${(@f)$(<"$test_root/argv")}")
+check test "$actual_args[5]" = /home/pane-user/.config/claude-master
 
 # ---- a client directory, an auto launch (what an unattended launcher runs), and a name with a space
 reset_case
@@ -117,7 +128,7 @@ check test "$test_meta" = 'server-v1 pool.internal:8443 /home/example/.config/cl
 reset_case
 export TCLAUDE_INFERENCE_SERVER=203.0.113.5:8443
 check run_case --remote-control
-check contains "$test_sent" 'nosync-wrap claude-master connect --server 203.0.113.5:8443 -- '
+check contains "$test_sent" 'nosync-wrap claude-master connect --server 203.0.113.5:8443 --dir "$HOME/.config/claude-master" -- '
 check test "$test_meta" = 'server-v1 203.0.113.5:8443 -'
 export TCLAUDE_INFERENCE_DIR=/home/example/.cfg
 reset_case
@@ -137,7 +148,7 @@ check test "${test_sent//connect/}" = "$test_sent"
 check test -z "$test_meta"
 reset_case
 check run_case --inference-server other.internal:9000 --remote-control
-check contains "$test_sent" '--server other.internal:9000 --'
+check contains "$test_sent" '--server other.internal:9000 --dir'
 check test "${test_sent//203.0.113.5/}" = "$test_sent"
 unset TCLAUDE_INFERENCE_SERVER
 
@@ -152,7 +163,7 @@ reset_case
 export TCLAUDE_INFERENCE_SERVER=env.internal:8443
 test_exists=1 test_meta='server-v1 saved.internal:8443 -'
 check run_case --resume conversation
-check contains "$test_sent" '--server saved.internal:8443 -- --resume conversation'
+check contains "$test_sent" '--server saved.internal:8443 --dir "$HOME/.config/claude-master" -- --resume conversation'
 unset TCLAUDE_INFERENCE_SERVER
 
 # ---- fail closed: a saved value that cannot be read never starts a plain claude
