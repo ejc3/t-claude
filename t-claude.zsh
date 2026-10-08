@@ -103,8 +103,8 @@
 #                   Cannot combine with --agent-label.
 #   --inference-server <host:port> : use a SHARED claude-master server for inference
 #                   (`claude-master connect`): the server holds the subscription logins, this
-#                   box holds only a client certificate (--inference-dir, default the client
-#                   directory claude-master itself uses, ~/.config/claude-master). The
+#                   box holds only a client certificate (--inference-dir, default
+#                   $HOME/.config/claude-master as the launched shell sees it). The
 #                   native login, tools, permissions, hooks, --continue and Remote Control stay
 #                   Claude's. TCLAUDE_INFERENCE_SERVER and TCLAUDE_INFERENCE_DIR in the
 #                   environment are the same two knobs, so an unattended launcher sets them
@@ -680,10 +680,12 @@ _tclaude_inference_server_command() {
     print -u2 -r -- 't-claude: invalid --inference-dir (an absolute path of letters, digits, dots, hyphens and slashes)'
     return 1
   fi
+  # `connect` has no default client directory of its own. Without --inference-dir it is $HOME/.config/claude-master,
+  # left for the shell that runs the line to expand: the pane's HOME, not the caller's.
   local -a args; args=(claude-master connect --server "$server")
-  [ -z "$dir" ] || args+=(--dir "$dir")
-  args+=(--)
-  print -r -- "${(j: :)${(@q)args}}"
+  local line="${(j: :)${(@q)args}}"
+  if [ -n "$dir" ]; then line+=" --dir ${(q)dir}"; else line+=' --dir "$HOME/.config/claude-master"'; fi
+  print -r -- "$line --"
 }
 
 # Claude's model settings that live in its ENVIRONMENT. Claude runs in a tmux pane, whose shell
