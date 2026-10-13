@@ -135,6 +135,11 @@ check test "${test_sent//example-box\\ my\\ game/}" = "$test_sent"
 reset_case
 CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=pre TCLAUDE_BOX=example-box check run_case --remote-control
 check test "${test_sent//example-box\\ my\\ game/}" = "$test_sent"
+check contains "$test_sent" "--remote-control-session-name-prefix pre"
+# ...and it lands before a bare `--`, never after it.
+reset_case
+CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=pre check run_case --remote-control -- --x
+check contains "$test_sent" "--remote-control-session-name-prefix pre -- --x"
 
 # After a bare `--` everything is the caller's own: nothing is named there.
 reset_case

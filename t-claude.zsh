@@ -1529,15 +1529,21 @@ HOOKSJSON
   # names the box (default: the short hostname). A name the caller gave, as the flag's value or with
   # --remote-control-session-name-prefix (or its environment form), is left alone, and so is everything after a bare `--`
   # (arguments the caller passes through untouched).
-  local -i rci=1
-  # CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX is the environment form of the prefix flag: a caller who set
-  # it chose its own naming, so it is honoured like the flag.
-  [[ -n "${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX:-}" ]] && rci=0
-  (( rci )) && for (( rci = 1; rci <= ${#passthrough}; rci++ )); do
+  local -i rci rcprefix=0 rcflag=0
+  for (( rci = 1; rci <= ${#passthrough}; rci++ )); do
     [[ "${passthrough[rci]}" == -- ]] && break
-    [[ "${passthrough[rci]}" == --remote-control-session-name-prefix* ]] && { rci=0; break }
+    [[ "${passthrough[rci]}" == --remote-control-session-name-prefix* ]] && rcprefix=1
+    [[ "${passthrough[rci]}" == --remote-control || "${passthrough[rci]}" == --rc ]] && rcflag=1
   done
-  if (( rci )); then
+  # CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX is the environment form of the prefix flag: a caller who set it
+  # chose its own naming. The pane runs with the tmux server's environment, not the caller's, so it is passed
+  # as the flag (inserted before any `--`), which also keeps it from being overridden by a generated name.
+  if (( rcflag && ! rcprefix )) && [[ -n "${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX:-}" ]]; then
+    local -i rcsep=${passthrough[(i)--]}
+    passthrough[rcsep,rcsep-1]=(--remote-control-session-name-prefix "$CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX")
+    rcprefix=1
+  fi
+  if (( ! rcprefix )); then
     for (( rci = 1; rci <= ${#passthrough}; rci++ )); do
       case "${passthrough[rci]}" in
         --) break ;;
