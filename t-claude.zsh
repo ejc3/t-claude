@@ -1527,10 +1527,13 @@ HOOKSJSON
   # --remote-control gets a generated name, "<hostname>-<adjective>-<surname>", and a cloud host's
   # hostname is often an address: dozens of sessions that differ only in a random word. TCLAUDE_BOX
   # names the box (default: the short hostname). A name the caller gave, as the flag's value or with
-  # --remote-control-session-name-prefix, is left alone, and so is everything after a bare `--`
+  # --remote-control-session-name-prefix (or its environment form), is left alone, and so is everything after a bare `--`
   # (arguments the caller passes through untouched).
-  local -i rci
-  for (( rci = 1; rci <= ${#passthrough}; rci++ )); do
+  local -i rci=1
+  # CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX is the environment form of the prefix flag: a caller who set
+  # it chose its own naming, so it is honoured like the flag.
+  [[ -n "${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX:-}" ]] && rci=0
+  (( rci )) && for (( rci = 1; rci <= ${#passthrough}; rci++ )); do
     [[ "${passthrough[rci]}" == -- ]] && break
     [[ "${passthrough[rci]}" == --remote-control-session-name-prefix* ]] && { rci=0; break }
   done

@@ -101,7 +101,7 @@ run_sent() {
 }
 seen() { grep -qxF -- "$1" "$test_root/env"; }
 
-unset TCLAUDE_BOX
+unset TCLAUDE_BOX CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX
 # A bare flag, the box named: the name follows the flag as one argument.
 reset_case
 TCLAUDE_BOX=example-box check run_case --remote-control
@@ -129,6 +129,11 @@ check contains "$test_sent" "--remote-control mine"
 check test "${test_sent//example-box\\ my\\ game/}" = "$test_sent"
 reset_case
 TCLAUDE_BOX=example-box check run_case --remote-control --remote-control-session-name-prefix pre
+check test "${test_sent//example-box\\ my\\ game/}" = "$test_sent"
+
+# The prefix's environment form is honoured like the flag.
+reset_case
+CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=pre TCLAUDE_BOX=example-box check run_case --remote-control
 check test "${test_sent//example-box\\ my\\ game/}" = "$test_sent"
 
 # After a bare `--` everything is the caller's own: nothing is named there.
