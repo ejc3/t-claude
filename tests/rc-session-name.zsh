@@ -104,36 +104,41 @@ seen() { grep -qxF -- "$1" "$test_root/env"; }
 unset TCLAUDE_BOX
 # A bare flag, the box named: the name follows the flag as one argument.
 reset_case
-TCLAUDE_BOX=fcvm check run_case --remote-control
-check contains "$test_sent" "--remote-control fcvm\\ my\\ game"
+TCLAUDE_BOX=example-box check run_case --remote-control
+check contains "$test_sent" "--remote-control example-box\\ my\\ game"
 
 # Not named: the short hostname.
 reset_case
-HOST=ip-10-0-0-1.us-west-1.compute.internal check run_case --remote-control
-check contains "$test_sent" "--remote-control ip-10-0-0-1\\ my\\ game"
+HOST=host-a.example.internal check run_case --remote-control
+check contains "$test_sent" "--remote-control host-a\\ my\\ game"
 
 # The alias, followed by another flag.
 reset_case
-TCLAUDE_BOX=nextjs check run_case --rc --effort high
-check contains "$test_sent" "--rc nextjs\\ my\\ game --effort high"
+TCLAUDE_BOX=example-box-2 check run_case --rc --effort high
+check contains "$test_sent" "--rc example-box-2\\ my\\ game --effort high"
 
 # From TCLAUDE_ARGS, as agents-start sets it.
 reset_case
-TCLAUDE_BOX=fcvm TCLAUDE_ARGS=--remote-control check run_case
-check contains "$test_sent" "--remote-control fcvm\\ my\\ game"
+TCLAUDE_BOX=example-box TCLAUDE_ARGS=--remote-control check run_case
+check contains "$test_sent" "--remote-control example-box\\ my\\ game"
 
 # A name the caller gave is kept, and so is a prefix.
 reset_case
-TCLAUDE_BOX=fcvm check run_case --remote-control mine
+TCLAUDE_BOX=example-box check run_case --remote-control mine
 check contains "$test_sent" "--remote-control mine"
-check test "${test_sent//fcvm\\ my\\ game/}" = "$test_sent"
+check test "${test_sent//example-box\\ my\\ game/}" = "$test_sent"
 reset_case
-TCLAUDE_BOX=fcvm check run_case --remote-control --remote-control-session-name-prefix pre
-check test "${test_sent//fcvm\\ my\\ game/}" = "$test_sent"
+TCLAUDE_BOX=example-box check run_case --remote-control --remote-control-session-name-prefix pre
+check test "${test_sent//example-box\\ my\\ game/}" = "$test_sent"
+
+# After a bare `--` everything is the caller's own: nothing is named there.
+reset_case
+TCLAUDE_BOX=example-box check run_case -- --rc
+check test "${test_sent//example-box\\ my\\ game/}" = "$test_sent"
 
 # No remote control: nothing added.
 reset_case
-TCLAUDE_BOX=fcvm check run_case
+TCLAUDE_BOX=example-box check run_case
 check test "${test_sent//--remote-control/}" = "$test_sent"
 
 print -r -- "rc-session-name: $test_checks checks passed"
