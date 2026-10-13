@@ -1523,6 +1523,27 @@ HOOKSJSON
     (( dseen )) || passthrough+=("$d")
   done
 
+  # Name the Remote Control session after the box and the folder ("fcvm aws"). A bare
+  # --remote-control gets a generated name, "<hostname>-<adjective>-<surname>", and on an EC2 host the
+  # hostname is ip-10-0-0-1: dozens of sessions that differ only in a random word. TCLAUDE_BOX names
+  # the box (default: the short hostname). A name the caller gave, as the flag's value or with
+  # --remote-control-session-name-prefix, is left alone.
+  local -i rci
+  for (( rci = 1; rci <= ${#passthrough}; rci++ )); do
+    [[ "${passthrough[rci]}" == --remote-control-session-name-prefix* ]] && { rci=0; break }
+  done
+  if (( rci )); then
+    for (( rci = 1; rci <= ${#passthrough}; rci++ )); do
+      case "${passthrough[rci]}" in
+        --remote-control|--rc)
+          if (( rci == ${#passthrough} )) || [[ "${passthrough[rci+1]}" == -* ]]; then
+            passthrough[rci]=("${passthrough[rci]}" "${TCLAUDE_BOX:-${HOST%%.*}} ${folder:t}")
+          fi
+          break ;;
+      esac
+    done
+  fi
+
   local extra=""
   if [ "${#passthrough[@]}" -gt 0 ]; then
     local -a qpass; qpass=("${(@q)passthrough}")
