@@ -465,7 +465,7 @@ _tclaude_mint_view() {
   # ARMED FROM client-attached, not set here: a freshly minted view is clientless for the
   # moment between new-session and attach, and setting the option then destroys the view
   # before its client can arrive (measured -- the attach finds no session).
-  tmux set-hook -t "$view" client-attached "set-option -t $view destroy-unattached on" 2>/dev/null
+  tmux set-hook -t "$view" client-attached "set-option -t '$view' destroy-unattached on" 2>/dev/null
   printf '%s\n' "$view"
 }
 
@@ -1155,13 +1155,15 @@ t-claude() {
   # Every launch rewrites live views' hooks to the current generation, so upgrades take
   # effect without every shell re-sourcing.
   local hv hh hw
-  for hv in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '__tcv__' 2>/dev/null); do
+  # One name per line, never word-split: a session name can contain spaces.
+  for hv in "${(@f)$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '__tcv__' 2>/dev/null)}"; do
+    [ -n "$hv" ] || continue
     # Retire the old client-detached reaper wherever it is still live. It fires on every
     # detach and kills the whole view, so a second terminal opening and closing on a view
     # takes the first one's session with it.
     if tmux show-hooks -t "$hv" 2>/dev/null | grep -q "client-detached.*kill-session"; then
       tmux set-hook -u -t "$hv" client-detached 2>/dev/null
-      tmux set-hook -t "$hv" client-attached "set-option -t $hv destroy-unattached on" 2>/dev/null
+      tmux set-hook -t "$hv" client-attached "set-option -t '$hv' destroy-unattached on" 2>/dev/null
       # Arm the option now only for a view that DEMONSTRABLY has a client -- one attached
       # before this heal existed never ran its client-attached hook. The test must fail SAFE:
       # destroy-unattached on a CLIENTLESS session destroys it on the spot (measured), so
@@ -1188,7 +1190,8 @@ t-claude() {
   # new-session and attach, and a concurrent launch's reap must not kill one mid-setup. Never
   # touches cmux-view-* or real sessions. `date` failing -> now=0 -> reaps nothing (safe).
   local vs now; now="$(date +%s 2>/dev/null || echo 0)"
-  for vs in $(tmux list-sessions -F '#{session_name} #{session_attached} #{session_created}' 2>/dev/null | awk -v now="$now" '$1 ~ /__tcv__[0-9]+$/ && $2==0 && (now-$3) > 20 {print $1}'); do
+  for vs in "${(@f)$(tmux list-sessions -F $'#{session_name}\t#{session_attached}\t#{session_created}' 2>/dev/null | awk -F'\t' -v now="$now" '$1 ~ /__tcv__[0-9]+$/ && $2==0 && (now-$3) > 20 {print $1}')}"; do
+    [ -n "$vs" ] || continue
     tmux kill-session -t "=$vs" 2>/dev/null
   done
 
@@ -1319,7 +1322,7 @@ t-claude() {
   # session each live in their own terminal tab without detaching, so one shared session is fine.)
   if [ -n "$session" ]; then
     explicit=1
-    session="$(printf '%s' "$session" | tr -c 'A-Za-z0-9_-' '_')"
+    session="$(printf '%s' "$session" | tr -c 'A-Za-z0-9_ -' '_')"
   else
     session="main"
   fi
@@ -1447,10 +1450,12 @@ fi
 # /branch reaches here with source=fork in a live pane (the only path that does). At fork time
 # claude is still in the checkout the branch was spawned from -- cwd is that source tree. Hand
 # off to an optional host-local extension: TC_CWD is the source checkout to derive from, TC_SID
-# the new branch id, TC_PANE the pane to drive. t-claude names no workflow of its own.
+# the new branch id, TC_PANE the pane to drive. TC_PREV_SID is the id this window showed until
+# now, read before the re-stamp above replaced it: the pane has become the branch, and nothing
+# else still knows which conversation it left. t-claude names no workflow of its own.
 if [ "$src" = "fork" ] && [ "$managed" = 1 ]; then
   bh="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude/branch-hook"
-  [ -x "$bh" ] && TC_PANE="$TMUX_PANE" TC_SID="$sid" TC_CWD="${cwd:-$npath}" "$bh" >/dev/null 2>&1
+  [ -x "$bh" ] && TC_PANE="$TMUX_PANE" TC_SID="$sid" TC_CWD="${cwd:-$npath}" TC_PREV_SID="$rid" "$bh" >/dev/null 2>&1
 fi
 exit 0
 SSYNC
@@ -1670,13 +1675,16 @@ HOOKSJSON
   # unrelated tab still routes to that group rather than dragging this window into it.
   local adopted=0 here="" here_home=""
   if [ -n "${TMUX-}" ] && [ -t 0 ] && [ "${TCLAUDE_ADOPT_PANE:-1}" = 1 ]; then
-    here="$(tmux display-message -p '#{window_id}' 2>/dev/null)"
+    # Name this shell's own pane. An untargeted display-message answers for the client's current
+    # window, and under a control-mode client such as cmux's that is whichever window the client
+    # last selected, not the window this command runs in.
+    [ -n "${TMUX_PANE-}" ] && here="$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)"
     if [ -n "$here" ]; then
       # The client may be attached to a linked view (cmux's mirror, or t-claude's own
       # __tcv__), where `#{session_name}` names the view rather than the window's home.
       # Ask which real session owns the window instead.
-      here_home="$(tmux list-windows -a -F '#{session_name} #{window_id}' 2>/dev/null \
-        | awk -v w="$here" '$2==w && $1 !~ /^cmux-view-/ && $1 !~ /__tcv__/ {print $1; exit}')"
+      here_home="$(tmux list-windows -a -F $'#{session_name}\t#{window_id}' 2>/dev/null \
+        | awk -F'\t' -v w="$here" '$2==w && $1 !~ /^cmux-view-/ && $1 !~ /__tcv__/ {print $1; exit}')"
     fi
     if [ -n "$here_home" ] && [ "$here_home" = "$session" ]; then
       win="$here"
@@ -1708,9 +1716,9 @@ HOOKSJSON
     # by `list-windows -a` (its home session AND the view). Exclude view sessions here, matching
     # cmux's own invariant (all "cmux-view-*" excluded; each window has one deterministic home).
     # Without this the move below could grab the linked copy and move-window it out of the view.
-    hit="$(tmux list-windows -a -F '#{session_name} #{window_id} #{@tclaude_key}' 2>/dev/null | awk -v k="$key" '$1 !~ /^cmux-view-/ && $3==k {print $1" "$2; exit}')"
+    hit="$(tmux list-windows -a -F $'#{session_name}\t#{window_id}\t#{@tclaude_key}' 2>/dev/null | awk -F'\t' -v k="$key" '$1 !~ /^cmux-view-/ && $3==k {print $1"\t"$2; exit}')"
     if [ -n "$hit" ]; then
-      osess="${hit% *}"; owin="${hit#* }"; ph=""
+      osess="${hit%%$'\t'*}"; owin="${hit#*$'\t'}"; ph=""
       if ! tmux has-session -t "=$session" 2>/dev/null; then
         ph="$(tmux new-session -d -P -F '#{window_id}' -s "$session" -c "$folder")"
       fi
