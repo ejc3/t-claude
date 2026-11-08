@@ -546,7 +546,7 @@ _tclaude_launch_file() {   # LAUNCH-LINE CACHE-DIR -- prints the text to type
   fi
 }
 
-typeset -g _tclaude_lock_fd=""
+typeset -g _tclaude_lock_fd="" _tclaude_lock_path=""
 _tclaude_launch_lock() {   # -- 0 with the server's launch lock held (<= 20s wait); else nothing launches
   _tclaude_launch_unlock   # one left behind by an interrupted run in this shell
   local sock dir f mode
@@ -571,6 +571,7 @@ _tclaude_launch_lock() {   # -- 0 with the server's launch lock held (<= 20s wai
   autoload -Uz is-at-least && is-at-least 5.9 && retry=(-i 0.05)
   if zmodload zsh/system 2>/dev/null && : >> "$f" 2>/dev/null &&
      zsystem flock -t "${_tclaude_lock_wait:-20}" "${retry[@]}" -f _tclaude_lock_fd "$f"; then
+    _tclaude_lock_path="$f"
     return 0
   fi
   _tclaude_lock_fd=""
@@ -579,7 +580,7 @@ _tclaude_launch_lock() {   # -- 0 with the server's launch lock held (<= 20s wai
 }
 _tclaude_launch_unlock() {
   [[ -n "$_tclaude_lock_fd" ]] && { zsystem flock -u "$_tclaude_lock_fd"; } 2>/dev/null
-  _tclaude_lock_fd=""
+  _tclaude_lock_fd="" _tclaude_lock_path=""
   return 0
 }
 
@@ -731,6 +732,36 @@ _tclaude_launch_line() {
   emulate -L zsh
   local folder="$1" inner="$2"
   print -r -- " cd -- ${(q)folder} && { $inner; tcrc=\$?; if [ \$tcrc -eq 0 ] || { [ \$tcrc -gt 128 ] && { [ \$tcrc -lt 145 ] || [ \$tcrc -gt 148 ]; }; }; then exit \$tcrc; fi; }"
+}
+
+# Auto Remote Control ownership is distinct from @tclaude_managed (an explicit UUID key).
+# Forget ownership first so partially cleared metadata never makes a window eligible.
+_tclaude_clear_auto_rc() {   # WINDOW
+  local opt
+  for opt in @tclaude_auto_rc @tclaude_auto_rc_started @tclaude_auto_rc_sid \
+             @tclaude_auto_rc_transcript @tclaude_auto_rc_source @tclaude_auto_rc_used; do
+    tmux set-option -wuq -t "$1" "$opt" 2>/dev/null || return 1
+  done
+}
+
+# Called only for a checked pane in which this invocation will start an agent, under
+# the launch lock. The hook can run as soon as Enter lands, so stamp before typing.
+# Like _tclaude_prepare_inference_window, this sees the caller's launch variables.
+_tclaude_type_agent() {   # WINDOW PANE
+  local win="$1" pane="$2" launch="$cmd" id="" started=""
+  [ -n "$pane" ] || return 1
+  _tclaude_clear_auto_rc "$win" || return 1
+  if (( auto_rc_candidate )) && [ -n "$_tclaude_lock_path" ]; then
+    read -r id started <<< "$(python3 -c 'import time, uuid; print(uuid.uuid4(), int(time.time()))' 2>/dev/null)"
+    if _tclaude_is_uuid "$id" && [[ "$started" == <1-> ]]; then
+      tmux set-option -w -t "$win" @tclaude_auto_rc_started "$started" || return 1
+      tmux set-option -w -t "$win" @tclaude_auto_rc "$id" || return 1
+      launch="$(_tclaude_launch_line "$folder" "TCLAUDE_AUTO_RC_ID=$id TCLAUDE_AUTO_RC_LOCK=${(q)_tclaude_lock_path} $inner")"
+    fi
+  fi
+  _tclaude_type "$pane" "$launch" "$tcache" && return 0
+  _tclaude_clear_auto_rc "$win"
+  return 1
 }
 
 # Called only immediately before launching an idle/new pane, never while attaching to an
@@ -1387,8 +1418,12 @@ t-claude() {
   # background /fork does not fire this hook at all, so only /branch reaches the extension.
   local tcache="${XDG_CACHE_HOME:-$HOME/.cache}/t-claude"
   mkdir -p "$tcache" 2>/dev/null
-  local ssync="$tcache/session-sync.sh"
-  cat > "$ssync" <<'SSYNC'
+  # Older shells still generate session-sync.sh and claude-hooks.json. Keep the
+  # tracked sessions' hook on a different path so a launch from such a shell
+  # cannot remove its prompt protection.
+  local ssync="$tcache/session-sync-auto-rc-v1.sh" ssync_tmp
+  ssync_tmp="$(mktemp "$tcache/.session-sync.XXXXXX")" || return 1
+  if cat > "$ssync_tmp" <<'SSYNC'
 #!/bin/sh
 # Reconcile a t-claude window's @tclaude_resume/@tclaude_path/@tclaude_key with claude's live
 # session id + cwd. Fed claude's SessionStart/UserPromptSubmit hook JSON on stdin; a no-op
@@ -1398,6 +1433,100 @@ t-claude() {
 # @tclaude_path and @tclaude_resume current is all the title needs after a /cd relocation.
 IN=$(cat)
 [ -n "$TMUX" ] && [ -n "$TMUX_PANE" ] || exit 0
+
+# A delayed hook from an earlier process must not change a window that was
+# reused or claimed by a person. Carry the launch id in Claude's environment
+# and compare it with the window's tag before writing anything.
+if [ -n "${TCLAUDE_AUTO_RC_ID:-}" ]; then
+  printf '%s' "$IN" | python3 -c '
+import fcntl
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+launch = os.environ.get("TCLAUDE_AUTO_RC_ID", "")
+pane = os.environ.get("TMUX_PANE", "")
+socket = os.environ.get("TMUX", "").split(",", 1)[0]
+lock = os.environ.get("TCLAUDE_AUTO_RC_LOCK", "")
+uuid = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+if not re.fullmatch(uuid, launch) or not re.fullmatch(r"%[0-9]+", pane) or not socket.startswith("/"):
+    sys.exit(0)
+
+def tmux(*args):
+    return subprocess.run(["tmux", "-S", socket, *args], check=True, timeout=4,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.rstrip("\n")
+
+def option(name):
+    return tmux("display-message", "-p", "-t", pane, "#{@" + name + "}")
+
+def stamp(name, value):
+    tmux("set-option", "-w", "-t", pane, "@" + name, value)
+
+def protect():
+    # A prompt marks the session used before waiting on a lock or parsing its
+    # contents. tmux tests the token and sets the latch in its command queue.
+    tmux("if-shell", "-F", "-t", pane, "#{==:#{@tclaude_auto_rc}," + launch + "}",
+         "set-option -w -t " + pane + " @tclaude_auto_rc_used 1")
+
+try:
+    if sys.argv[1] == "prompt":
+        protect()
+        sys.exit(0)
+    if sys.argv[1] != "start":
+        sys.exit(0)
+    hook = json.load(sys.stdin)
+    if not isinstance(hook, dict) or hook.get("hook_event_name") != "SessionStart":
+        protect()
+        sys.exit(0)
+    sid, transcript, source = hook.get("session_id"), hook.get("transcript_path"), hook.get("source")
+    if (not isinstance(sid, str) or not re.fullmatch(uuid, sid)
+            or not isinstance(transcript, str) or not os.path.isabs(transcript)
+            or os.path.basename(transcript) != sid + ".jsonl"
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in transcript)):
+        protect()
+        sys.exit(0)
+    fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid() or not stat.S_ISREG(st.st_mode):
+            protect()
+            sys.exit(0)
+        # zsystem flock uses a POSIX record lock, the same as lockf. The
+        # launch can still hold it while Claude runs its SessionStart hook.
+        deadline = time.monotonic() + 8
+        while True:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    protect()
+                    sys.exit(0)
+                time.sleep(0.05)
+        if option("tclaude_auto_rc") != launch:
+            sys.exit(0)
+        prior_sid, prior_path = option("tclaude_auto_rc_sid"), option("tclaude_auto_rc_transcript")
+        if (prior_sid or prior_path) and (prior_sid != sid or prior_path != transcript):
+            # /clear, /branch, or a transcript relocation is activity too.
+            stamp("tclaude_auto_rc_used", "1")
+        stamp("tclaude_auto_rc_sid", sid)
+        stamp("tclaude_auto_rc_transcript", transcript)
+        stamp("tclaude_auto_rc_source", source if isinstance(source, str) and re.fullmatch(r"[a-z]+", source) else "")
+    finally:
+        os.close(fd)
+except (ValueError, OSError, subprocess.SubprocessError):
+    # Missing or invalid metadata never proves that a session is empty.
+    try:
+        protect()
+    except (OSError, subprocess.SubprocessError):
+        pass
+' "${1:-}" >/dev/null 2>&1
+fi
+
 key=$(tmux display-message -p -t "$TMUX_PANE" '#{@tclaude_key}' 2>/dev/null)
 [ -n "$key" ] || exit 0
 rid=$(tmux display-message -p -t "$TMUX_PANE" '#{@tclaude_resume}' 2>/dev/null)
@@ -1454,7 +1583,11 @@ if [ "$src" = "fork" ] && [ "$managed" = 1 ]; then
 fi
 exit 0
 SSYNC
-  chmod +x "$ssync" 2>/dev/null
+  then
+    chmod 700 "$ssync_tmp" && mv -f -- "$ssync_tmp" "$ssync" || { rm -f -- "$ssync_tmp"; return 1; }
+  else
+    rm -f -- "$ssync_tmp"; return 1
+  fi
   # Carry claude's "wants attention" events out to the enclosing terminal as a desktop
   # notification: an OSC 777 wrapped for tmux passthrough, written to the pane's own tty so
   # it rides the same path as any pane output. The hook fires on the Notification event
@@ -1482,14 +1615,20 @@ printf '\033Ptmux;\033\033]777;notify;%s;%s\007\033\\' "$title" "$body" > "$tty"
 exit 0
 NOTIFY
   chmod +x "$notify" 2>/dev/null
-  local hooksjson="$tcache/claude-hooks.json"
+  local hooksjson="$tcache/claude-hooks-auto-rc-v1.json" hooks_tmp
   # The hook is the single notifier, so claude's own channel is off: under a control-mode
   # client claude reads as never-focused and would ring its own bell beside every hook
   # notification, while under a plain attach it reads as always-focused and stays silent
   # -- neither belief is worth keeping when the hook fires on the event itself.
-  cat > "$hooksjson" <<HOOKSJSON
-{"preferredNotifChannel":"notifications_disabled","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ssync","timeout":90}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$ssync","timeout":30}]}],"Notification":[{"hooks":[{"type":"command","command":"$notify","timeout":10}]}]}}
+  hooks_tmp="$(mktemp "$tcache/.claude-hooks.XXXXXX")" || return 1
+  if cat > "$hooks_tmp" <<HOOKSJSON
+{"preferredNotifChannel":"notifications_disabled","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ssync start","timeout":90}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$ssync prompt","timeout":30}]}],"Notification":[{"hooks":[{"type":"command","command":"$notify","timeout":10}]}]}}
 HOOKSJSON
+  then
+    mv -f -- "$hooks_tmp" "$hooksjson" || { rm -f -- "$hooks_tmp"; return 1; }
+  else
+    rm -f -- "$hooks_tmp"; return 1
+  fi
   local hooks_flag=" --settings ${(q)hooksjson}"
   local pel
   for pel in "${passthrough[@]}"; do
@@ -1631,6 +1770,20 @@ HOOKSJSON
   # the cd fails the launch stops there and the shell stays for the error.
   cmd="$(_tclaude_launch_line "$folder" "$inner")"
 
+  # Only the unattended, plain folder-keyed Claude launch can be retired by
+  # its caller. Custom settings can bypass our hooks, so do not track them.
+  local auto_rc_launch=0 auto_rc_candidate=0
+  if (( auto && rcflag && ! explicit )) && ! [ -t 0 ] &&
+     [ -z "$tcid" ] && [ -z "$agent_cmd" ] && [ "$agent_label" = claude ]; then
+    auto_rc_launch=1
+    if [ -n "$hooks_flag" ] && command -v python3 >/dev/null 2>&1; then
+      auto_rc_candidate=1
+      for pel in "${passthrough[@]}"; do
+        case "$pel" in --settings|--settings=*|--no-session-persistence|--no-session-persistence=*|--print|-p) auto_rc_candidate=0 ;; esac
+      done
+    fi
+  fi
+
   # A new window sized for that terminal is pinned (window-size manual) until the terminal
   # shows it; this puts its own window-size back, chained onto the attach/switch below.
   local -a unpin
@@ -1639,6 +1792,16 @@ HOOKSJSON
   # From here until the window is stamped, this is the server's only launch (LAUNCH TYPING).
   _tclaude_launch_lock || return 1
   {
+  # The operator's unattended-launch policy must be checked under this lock:
+  # a reaper could retire the folder after an earlier caller-side check.
+  if (( auto_rc_launch )) && [ -n "${TCLAUDE_RC_GATE:-}" ]; then
+    if [[ "$TCLAUDE_RC_GATE" != /* ]] || [ ! -x "$TCLAUDE_RC_GATE" ] ||
+       ! "$TCLAUDE_RC_GATE" --check-claude-rc "$folder"; then
+      print -u2 -r -- "t-claude: automatic Remote Control launch refused for $folder"
+      return 1
+    fi
+  fi
+
   # The size of the terminal this launch will show the window in (see LAUNCH TYPING): known only
   # with one -- a tty -- that is not a control-mode client, which is left where it is below.
   local attach_cols="" attach_rows=""
@@ -1689,7 +1852,7 @@ HOOKSJSON
       [ -n "$winname" ] && tmux rename-window -t "$win" "$winname" 2>/dev/null
       # This pane's own shell runs the line once t-claude returns: nothing to wait for.
       _tclaude_prepare_inference_window "$win" || return 1
-      _tclaude_type "${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}" "$cmd" "$tcache" && launched=1
+      _tclaude_type_agent "$win" "${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}" && launched=1
     fi
   fi
 
@@ -1787,7 +1950,7 @@ HOOKSJSON
       tmux resize-window -t "$win" -x "$attach_cols" -y "$attach_rows" 2>/dev/null
     fi
     _tclaude_await_editor "$new_pane"
-    if ! _tclaude_type "$new_pane" "$cmd" "$tcache"; then
+    if ! _tclaude_type_agent "$win" "$new_pane"; then
       (( ${#unpin} )) && tmux "${unpin[@]}" 2>/dev/null
       printf "t-claude: the new window's pane is gone; nothing was launched\n" >&2
       return 1
@@ -1833,7 +1996,7 @@ HOOKSJSON
           tmux send-keys -R -t "$pane_id" '' 2>/dev/null
           tmux send-keys -t "$pane_id" C-u 2>/dev/null
         fi
-        if _tclaude_type "$pane_id" "$cmd" "$tcache"; then
+        if _tclaude_type_agent "$win" "$pane_id"; then
           launched=1
           (( own )) || _tclaude_await_agent "$pane_id" "$pane_pid" "$agent_label"
           printf "relaunched %s in this folder's window -- it had exited\n" "$agent_label" >&2
@@ -1845,6 +2008,12 @@ HOOKSJSON
         print -u2 -r -- "t-claude: attaching to the running window; its model was not changed (${model_settings[*]:-default}). Exit Claude first, then run this command again to change it."
       fi
     fi
+  fi
+
+  # A person who attaches via t-claude takes this window out of automatic
+  # retirement. A repeat unattended attach must not reset its age or latch.
+  if (( ! launched && ! auto_rc_launch )); then
+    _tclaude_clear_auto_rc "$win" || return 1
   fi
 
   # Stamp the folder + resume so _tclaude_relabel can title windows by path (the @tclaude_key is

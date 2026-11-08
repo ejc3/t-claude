@@ -73,6 +73,25 @@ tmux SERVER  (one per machine)
 - Only windows t-claude created carry `@tclaude_key`, so your **manual windows are never**
   found, reused, renamed, moved, or closed.
 
+## Unattended Remote Control
+
+A headless `t-claude --auto --remote-control` can be managed by its caller. When it
+actually starts a plain, folder-keyed Claude, t-claude stamps a unique launch ID and
+Unix start time as `@tclaude_auto_rc` and `@tclaude_auto_rc_started` on the window.
+Its SessionStart hook records the live session ID, absolute transcript path, and
+Claude's start source in `@tclaude_auto_rc_sid`, `@tclaude_auto_rc_transcript`, and
+`@tclaude_auto_rc_source`. The first submitted prompt sets `@tclaude_auto_rc_used=1`
+even if the turn fails. Reattaching unattended keeps these stamps; a manual
+t-claude attachment relinquishes them. Explicit conversation IDs, custom agents,
+and launches without the tracking hooks do not qualify for unattended retirement.
+
+A caller can set `TCLAUDE_RC_GATE` to an absolute executable. t-claude calls it
+with `--check-claude-rc <physical folder>` under the server's launch lock before
+an unattended launch or attachment; a nonzero exit refuses the operation. A
+cleanup tool must use a POSIX record lock on the same lock file, recheck the
+launch ID and transcript, and check the sticky prompt latch again in the tmux
+command that closes the pane. Missing stamps are not proof of an empty session.
+
 ## Install
 
 ```zsh
